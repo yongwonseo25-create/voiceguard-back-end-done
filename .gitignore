@@ -1,0 +1,105 @@
+# ============================================================
+# Voice Guard - .gitignore
+# 보안 최우선: AWS/B2 자격증명 절대 유출 금지
+# ============================================================
+
+# ✅ 1순위 보안: 환경변수 (절대 노출 금지)
+.env
+.env.*
+*.env
+.env.local
+.env.production
+.env.staging
+
+# ✅ Python 캐시 및 바이트코드
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+
+# ✅ 가상환경
+venv/
+.venv/
+env/
+ENV/
+.python-version
+
+# ✅ 패키지 빌드 산출물
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+wheels/
+
+# ✅ IDE / 에디터
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ✅ 운영체제 파일
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+
+# ✅ 로그 파일
+*.log
+logs/
+*.out
+
+# ✅ 임시 파일
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# ✅ 테스트 및 커버리지
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+
+# ✅ Jupyter Notebook
+.ipynb_checkpoints
+
+# ✅ mypy / pyright
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyright/
+
+# ✅ 데이터베이스 덤프 (자격증명 포함 가능)
+*.dump
+*.sql.gz
+
+# ✅ 오디오 파일 (증거 원본 — 절대 Git 추적 금지)
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.flac
+*.aac
+
+# ✅ 노트/스크래치
+scratch/
+notes/
+TODO.md
