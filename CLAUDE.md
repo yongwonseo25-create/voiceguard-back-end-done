@@ -1,0 +1,32 @@
+## 1. Northstar
+- 데이터 유실 0% 및 환수 방어
+- Source of Truth: 추측 금지, 실제 코드 기반의 결정론적 검증만 인정
+
+## 2. Model Allocation
+- Architecture & Planning: Opus 4.6 (Deep reasoning)
+- Basic Coding: Sonnet (Standard implementation)
+- Evaluator & Formatting: Haiku (Cost/Speed optimization)
+- Research & Large Context: Gemini Flash (Opus 85% quality, 1/10 cost)
+
+## 3. GSD Workflow (7-Step Pipeline)
+1. Map -> 2. New -> 3. Discuss -> 4. Plan -> 5. Execute -> 6. Verify -> 7. Next
+- Generator(Opus/Sonnet)와 Evaluator(Haiku)를 엄격히 분리
+- 'Done Contract' 확정 전에는 구현 착수 금지
+
+## 4. Context Hygiene & Efficiency
+- One Window = One Task (주제 전환 시 /clear 및 새 세션)
+- /compact: 컨텍스트 60% 도달 전 수행 (98.5% 재독 비용 방지)
+- Peak Hours: ET 8am-2pm 회피 (세션 한도 관리)
+- Window: 첫 메시지 후 5시간 윈도우 관리 준수
+
+## 5. Applied Learning (Gotchas)
+- 중복 가드는 공통 밸리데이터에만 집중한다. (7단어)
+- 신규 기능과 클린업을 한 커밋에 섞지 않는다. (9단어)
+- 평가자는 생성자의 가정을 배제하고 적대적으로 검증한다. (9단어)
+- 세션 종료 전 기술 부채 정리 스킬을 실행한다. (9단어)
+
+## 6. Runtime & Commands
+- MCP2CLI: 무거운 MCP는 CLI를 통해 필요 시에만 호출
+- Build: 프로젝트 표준 빌드 커맨드 사용
+- Test: 명시된 테스트 스위트 전체 실행
+- Skill: voice-guard-tech-debt (세션 종료 필수)

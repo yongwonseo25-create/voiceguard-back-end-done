@@ -9,3 +9,5 @@ psycopg2-binary==2.9.10
 python-dotenv==1.0.1
 python-multipart==0.0.18
 pydantic==2.10.3
+# Phase 2: 카카오 알림톡 (Solapi REST API v4)
+requests==2.32.3
