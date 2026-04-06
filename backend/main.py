@@ -194,6 +194,11 @@ async def ingest(
     try:
         with engine.begin() as conn:
             # [D-1] evidence_ledger: 불변 원장 INSERT
+            # CHAR(64) CHECK 제약 대응: 'pending' 7자 불가 → SHA-256 64자 플레이스홀더 사용
+            pending_audio = hashlib.sha256(f"audio_pending_{ledger_id}".encode()).hexdigest()
+            pending_tx    = hashlib.sha256(f"tx_pending_{ledger_id}".encode()).hexdigest()
+            pending_chain = hashlib.sha256(f"chain_pending_{ledger_id}".encode()).hexdigest()
+
             conn.execute(text("""
                 INSERT INTO evidence_ledger (
                     id, session_id, recorded_at, ingested_at,
@@ -207,17 +212,20 @@ async def ingest(
                 ) VALUES (
                     :id, :session_id, :recorded_at, :ingested_at,
                     :device_id, :facility_id,
-                    'pending', 'pending', 'pending',
+                    :audio_sha256, :transcript_sha256, :chain_hash,
                     '', 'ko', :case_type, false,
                     :beneficiary_id, :shift_id, :idempotency_key,
                     :care_type, :gps_lat, :gps_lon,
-                    :audio_size_kb, 'pending', 'pending', :recorded_at
+                    :audio_size_kb, 'voice-guard-korea', :worm_object_key, :recorded_at
                 )
             """), {
                 "id": ledger_id, "session_id": str(uuid4()),
                 "recorded_at": server_ts, "ingested_at": server_ts,
                 "device_id": device_id or "unknown",
                 "facility_id": facility_id,
+                "audio_sha256": pending_audio,
+                "transcript_sha256": pending_tx,
+                "chain_hash": pending_chain,
                 "case_type": care_type,
                 "beneficiary_id": beneficiary_id,
                 "shift_id": shift_id,
@@ -225,6 +233,7 @@ async def ingest(
                 "care_type": care_type,
                 "gps_lat": gps_lat, "gps_lon": gps_lon,
                 "audio_size_kb": audio_size_kb,
+                "worm_object_key": f"ingest/{ledger_id[:8]}.wav",
             })
 
             # [D-2] outbox_events: 비동기 처리 큐 INSERT (동일 트랜잭션)
@@ -234,7 +243,7 @@ async def ingest(
                     payload, created_at
                 ) VALUES (
                     :id, :ledger_id, 'pending', 0,
-                    :payload::jsonb, :created_at
+                    CAST(:payload AS jsonb), :created_at
                 )
             """), {
                 "id": str(uuid4()),
@@ -271,22 +280,26 @@ async def ingest(
     }
 
     if redis_pub:
+        # [E-1] Stream: 워커 비동기 처리 알림 (XADD 실패해도 PUBLISH는 독립 실행)
         try:
-            # [E-1] Stream: 워커 비동기 처리 알림
             await redis_pub.xadd(
                 REDIS_STREAM,
                 {"ledger_id": ledger_id, "server_ts": server_ts.isoformat()},
                 maxlen=10000,
             )
-            # [E-2] Pub/Sub: SSE 대시보드 즉시 갱신
+            logger.info(f"[INGEST] Redis XADD 완료.")
+        except Exception as e:
+            logger.warning(f"[INGEST] Redis XADD 실패 (outbox 폴링 백업): {e}")
+
+        # [E-2] Pub/Sub: SSE 대시보드 즉시 갱신 (XADD 실패와 무관하게 항상 실행)
+        try:
             await redis_pub.publish(
                 REDIS_SSE_CHANNEL,
                 json.dumps({"event": "new_evidence", "data": sse_event_data}, ensure_ascii=False),
             )
-            logger.info(f"[INGEST] Redis XADD + PUBLISH 완료.")
+            logger.info(f"[INGEST] Redis PUBLISH → SSE 완료.")
         except Exception as e:
-            # Redis 실패는 경고만 — DB 이미 커밋됨, 워커가 outbox 폴링으로 복구
-            logger.warning(f"[INGEST] Redis 알림 실패 (outbox 폴링 백업): {e}")
+            logger.warning(f"[INGEST] Redis PUBLISH 실패: {e}")
 
     # ── F. 202 즉시 반환 ──────────────────────────────────────
     return {

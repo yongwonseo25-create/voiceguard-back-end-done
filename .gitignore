@@ -39,6 +39,8 @@ develop-eggs/
 .installed.cfg
 lib/
 lib64/
+!dashboard/lib/
+!dashboard/lib/**
 wheels/
 
 # ✅ IDE / 에디터
