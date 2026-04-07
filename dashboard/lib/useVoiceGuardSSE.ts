@@ -16,8 +16,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { 알림카드데이터 } from "@/components/admin/types";
 
-const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+// 로컬 백엔드 URL 하드코딩 — 외부 터널/프록시 사용 금지
+const SSE_URL = "http://localhost:8000/api/sse/stream";
 
 // 예상 환수액 산정 기준 (케어 유형별 단가 × 1건)
 const 케어별환수단가: Record<string, number> = {
@@ -36,8 +36,7 @@ export function useVoiceGuardSSE() {
   const esRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
-    const url = `${API_BASE}/api/sse/stream`;
-    const es  = new EventSource(url);
+    const es = new EventSource(SSE_URL);
     esRef.current = es;
 
     // ── 연결 확인 ─────────────────────────────────────────────

@@ -11,3 +11,5 @@ python-multipart==0.0.18
 pydantic==2.10.3
 # Phase 2: 카카오 알림톡 (Solapi REST API v4)
 requests==2.32.3
+# Phase 4: Notion 미러 동기화 워커
+httpx==0.28.1

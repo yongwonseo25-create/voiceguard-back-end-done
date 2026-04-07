@@ -13,8 +13,10 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import AsyncGenerator, Optional
 from uuid import uuid4
 
@@ -28,6 +30,9 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
 from notifier import send_alimtalk, ALIMTALK_TPL_NT3, DEFAULT_FACILITY_PHONE
+from angel_bridge import router as angel_router, init_angel_bridge
+from angel_export import router as angel_export_router, init_angel_export
+from angel_rpa import router as angel_rpa_router, init_angel_rpa
 
 load_dotenv()
 
@@ -69,6 +74,11 @@ async def lifespan(app: FastAPI):
         logger.info("[STARTUP] Redis 연결 완료.")
     except Exception as e:
         logger.warning(f"[STARTUP] Redis 연결 실패: {e}")
+    # 엔젤 브리지 엔진 주입
+    init_angel_bridge(engine, redis_pub)
+    init_angel_export(engine, redis_pub)
+    init_angel_rpa(engine, redis_pub)
+    logger.info("[STARTUP] 엔젤 브리지 + Export + RPA 초기화 완료.")
     yield
     for r in (redis_pub, redis_sub):
         if r: await r.aclose()
@@ -89,6 +99,11 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "Cache-Control"],
 )
+
+# ── 엔젤 브리지 라우터 마운트 (기생형 Bounded Context) ──────────
+app.include_router(angel_router)
+app.include_router(angel_export_router)
+app.include_router(angel_rpa_router)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -160,11 +175,17 @@ async def ingest(
     # ── B. Idempotency Key ────────────────────────────────────
     idem_key = make_idempotency_key(facility_id, beneficiary_id, shift_id)
 
-    # ── C. 파일 수신 (최대 50MB) ──────────────────────────────
+    # ── C. 파일 수신 (최대 50MB) + 임시 저장 ────────────────
     audio_bytes = await audio_file.read()
     if len(audio_bytes) > 50 * 1024 * 1024:
         raise HTTPException(413, "파일 초과 (최대 50MB)")
     audio_size_kb = len(audio_bytes) // 1024
+
+    # 워커가 실제 오디오를 읽을 수 있도록 tmp에 저장
+    tmp_dir = Path(tempfile.gettempdir()) / "voice_guard_audio"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_audio_path = tmp_dir / f"{ledger_id}.wav"
+    tmp_audio_path.write_bytes(audio_bytes)
 
     # ── D. [핵심] Atomic Split: 단일 DB 트랜잭션 ─────────────
     #
@@ -189,6 +210,7 @@ async def ingest(
         "gps_lat":       gps_lat,
         "gps_lon":       gps_lon,
         "device_id":     device_id or "unknown",
+        "tmp_audio_path": str(tmp_audio_path),
     }, ensure_ascii=False)
 
     try:
@@ -287,7 +309,7 @@ async def ingest(
                 {"ledger_id": ledger_id, "server_ts": server_ts.isoformat()},
                 maxlen=10000,
             )
-            logger.info(f"[INGEST] Redis XADD 완료.")
+            logger.info("[INGEST] Redis XADD 완료.")
         except Exception as e:
             logger.warning(f"[INGEST] Redis XADD 실패 (outbox 폴링 백업): {e}")
 
@@ -297,7 +319,7 @@ async def ingest(
                 REDIS_SSE_CHANNEL,
                 json.dumps({"event": "new_evidence", "data": sse_event_data}, ensure_ascii=False),
             )
-            logger.info(f"[INGEST] Redis PUBLISH → SSE 완료.")
+            logger.info("[INGEST] Redis PUBLISH → SSE 완료.")
         except Exception as e:
             logger.warning(f"[INGEST] Redis PUBLISH 실패: {e}")
 

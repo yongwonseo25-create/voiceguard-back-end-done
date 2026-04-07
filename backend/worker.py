@@ -11,11 +11,19 @@ Redis Streams 무결점 비동기 워커 v2.0
   F. DB 실패      → engine.begin() 자동 롤백
 """
 
-import asyncio, hashlib, hmac as hm, io, json, logging, os, time
+import asyncio
+import hashlib
+import hmac as hm
+import io
+import json
+import logging
+import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
-import boto3, redis.asyncio as aioredis
+import boto3
+import redis.asyncio as aioredis
 from botocore.client import Config
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -160,15 +168,36 @@ async def process(redis: aioredis.Redis, ledger_id: str, msg_id: str):
     try:
         await acquire_token(redis)
 
-        # B2 WORM 업로드
+        # B2 WORM 업로드: 실제 오디오 파일 읽기
         b2 = get_b2()
         b2_key = f"evidence/{datetime.now(timezone.utc).strftime('%Y/%m/%d')}/{ledger_id}.wav"
-        audio_bytes = b"RIFF" + b"\x00" * 44  # 실제 운영: 원본 오디오 바이트
+
+        tmp_audio_path = meta.get("tmp_audio_path")
+        if not tmp_audio_path or not os.path.isfile(tmp_audio_path):
+            raise FileNotFoundError(f"오디오 파일 없음: {tmp_audio_path}")
+        with open(tmp_audio_path, "rb") as f:
+            audio_bytes = f.read()
+        if len(audio_bytes) < 100:
+            raise ValueError(f"오디오 파일 크기 비정상: {len(audio_bytes)} bytes")
+
         retain = datetime.now(timezone.utc) + timedelta(days=365 * WORM_YEARS)
         b2.put_object(Bucket=B2_BUCKET_NAME, Key=b2_key, Body=audio_bytes,
             ContentType="audio/wav", ObjectLockMode="COMPLIANCE",
             ObjectLockRetainUntilDate=retain)
         audio_sha256 = hashlib.sha256(audio_bytes).hexdigest()
+
+        # WORM COMPLIANCE 검증: head_object로 Object Lock 모드 확인
+        head = b2.head_object(Bucket=B2_BUCKET_NAME, Key=b2_key)
+        lock_mode = head.get("ObjectLockMode")
+        if lock_mode != "COMPLIANCE":
+            raise RuntimeError(f"WORM 검증 실패: ObjectLockMode={lock_mode} (expected COMPLIANCE)")
+        logger.info(f"[WORKER] WORM COMPLIANCE 검증 통과: {b2_key}")
+
+        # 업로드+검증 성공 후 tmp 파일 삭제
+        try:
+            os.remove(tmp_audio_path)
+        except OSError:
+            pass
 
         # Whisper 비동기 변환
         transcript = ""
@@ -296,7 +325,7 @@ async def main():
     redis = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
         await redis.xgroup_create(REDIS_STREAM, CONSUMER_GROUP, id="0", mkstream=True)
-        logger.info(f"[WORKER] Consumer Group 생성.")
+        logger.info("[WORKER] Consumer Group 생성.")
     except aioredis.ResponseError as e:
         if "BUSYGROUP" not in str(e): raise
 
