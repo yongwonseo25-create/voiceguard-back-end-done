@@ -13,3 +13,6 @@ pydantic==2.10.3
 requests==2.32.3
 # Phase 4: Notion 미러 동기화 워커
 httpx==0.28.1
+# Phase 1: Care Plan/Billing Excel 파싱
+pandas>=2.2.0
+openpyxl>=3.1.0

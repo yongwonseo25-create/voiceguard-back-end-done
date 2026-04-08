@@ -1,6 +1,7 @@
 ## 0. Absolute Rules (위반 시 즉시 중단)
 - **Core 원장(ledger) 테이블 스키마 수정 절대 금지** — 기존 컬럼 삭제/타입 변경/이름 변경 불가
 - **Append-only 유지** — UPDATE/DELETE on ledger rows 금지, 보정은 반드시 새 row INSERT
+- **트리거 원천 차단** — 모든 원장(Ledger)은 Append-Only이며 UPDATE/DELETE/TRUNCATE는 DB 트리거로 원천 차단한다. care_plan_ledger의 is_superseded/superseded_by 컬럼만 조건부 UPDATE 허용 (계획 무효화 전용)
 - **이중 노동 제로** — 같은 로직을 두 곳에 구현하지 않는다. 공통 함수로 추출
 - **Self-evaluation 금지** — 내가 작성한 코드를 스스로 "완벽하다"고 판단하지 않는다. 반드시 테스트/검증기 통과로만 확인
 - **고차원 목표 중심 실행** — 마이크로 구현 계획 나열 금지. 프로덕트 목표를 잡고 즉시 실행

@@ -34,6 +34,9 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
+from care_plan_api import router as care_plan_router
+from billing_api import router as billing_router
+
 load_dotenv()
 
 logging.basicConfig(
@@ -78,6 +81,10 @@ app.add_middleware(
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
+
+# ── Phase 1 라우터: 케어 계획 + 청구 원장 ────────────────────
+app.include_router(care_plan_router)
+app.include_router(billing_router)
 
 # ── 응답 모델 ────────────────────────────────────────────────
 class IngestResponse(BaseModel):
