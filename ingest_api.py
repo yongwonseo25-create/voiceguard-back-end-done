@@ -36,6 +36,7 @@ from sqlalchemy.exc import IntegrityError
 
 from care_plan_api import router as care_plan_router
 from billing_api import router as billing_router
+from reconciliation_api import router as reconciliation_router
 
 load_dotenv()
 
@@ -78,13 +79,16 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_methods=["POST", "GET", "OPTIONS", "PATCH"],
     allow_headers=["Content-Type", "Authorization"],
 )
 
 # ── Phase 1 라우터: 케어 계획 + 청구 원장 ────────────────────
 app.include_router(care_plan_router)
 app.include_router(billing_router)
+
+# ── Phase 3 라우터: 3각 검증 엔진 ──────────────────────────
+app.include_router(reconciliation_router)
 
 # ── 응답 모델 ────────────────────────────────────────────────
 class IngestResponse(BaseModel):
