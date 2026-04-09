@@ -296,11 +296,14 @@ async def _alert_handler(event_id: str, payload: dict, attempt_num: int):
 # Event Router — 핵심 디스패처
 # ══════════════════════════════════════════════════════════════
 
+from handover_handler import handover_handler as _handover_handler_fn, check_undelivered_handovers
+
 _HANDLERS = {
-    "ingest":    (_ingest_handler,  "IngestHandler"),
-    "notion":    (_notion_handler,  "NotionHandler"),
-    "reconcile": (_recon_handler,   "ReconHandler"),
-    "alert":     (_alert_handler,   "AlertHandler"),
+    "ingest":           (_ingest_handler,      "IngestHandler"),
+    "notion":           (_notion_handler,      "NotionHandler"),
+    "reconcile":        (_recon_handler,       "ReconHandler"),
+    "alert":            (_alert_handler,       "AlertHandler"),
+    "handover_trigger": (_handover_handler_fn, "HandoverHandler"),
 }
 
 
@@ -514,6 +517,20 @@ async def main():
                 if overdue_tick >= 6:    # 약 30초마다
                     overdue_tick = 0
                     await _check_overdue_alerts()
+                    # Phase 5: 미수령 인수인계 브리핑 NT-4 알림 발행
+                    for item in check_undelivered_handovers(_engine):
+                        _publish_event("alert", {
+                            "trigger_type":  "NT-4",
+                            "handover_id":   item["handover_id"],
+                            "facility_id":   item["facility_id"],
+                            "phone":         os.getenv("DEFAULT_FACILITY_PHONE", ""),
+                            "template_code": os.getenv("ALIMTALK_TPL_NT4", ""),
+                            "variables": {
+                                "#{요양기관}":   item["facility_id"],
+                                "#{교대마감}":   item["shift_end"],
+                                "#{생성시각}":   item["generated_at"],
+                            },
+                        })
                 continue
 
             for _, msgs in messages:

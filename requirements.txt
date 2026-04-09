@@ -16,3 +16,10 @@ httpx==0.28.1
 # Phase 1: Care Plan/Billing Excel 파싱
 pandas>=2.2.0
 openpyxl>=3.1.0
+# Phase 4: Redis asyncio
+redis>=5.0.0
+# Phase 5: 인수인계 엔진 — LLM 브리핑 (Anthropic claude-haiku)
+anthropic>=0.40.0
+# Phase 5: 비동기 핸들러 테스트
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
