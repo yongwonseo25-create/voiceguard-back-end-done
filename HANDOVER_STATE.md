@@ -1,6 +1,6 @@
-# Voice Guard — Phase 3 Handover State
+# Voice Guard — Phase 4 Handover State
 **Date:** 2026-04-09  
-**Status:** COMPLETE — Ready for Phase 4
+**Status:** COMPLETE — Ready for Phase 5
 
 ---
 
@@ -82,19 +82,52 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY public.canonical_time_fact;
 
 ---
 
-## Phase 4 진입 조건
+## Phase 4 산출물 (오늘 구축)
 
-### Phase 4 후보 작업
-1. **대시보드 연동**: `GET /api/v3/reconcile/results` → `ReconciliationPanel.tsx`
-2. **배치 스케줄러**: 매일 새벽 3시 `run_reconciliation()` 자동 실행 (cron)
-3. **MATERIALIZED VIEW 자동 갱신**: 검증 전 자동 REFRESH
-4. **알림 연동**: ANOMALY 탐지 시 카카오 알림톡 발송 (NT-4)
+### DB (schema_v11_phase4.sql)
+
+| 객체 | 유형 | 역할 |
+|------|------|------|
+| `unified_outbox`          | TABLE (Append-Only) | 단일 이벤트 원장 (Event Sourcing, UPDATE/DELETE 차단) |
+| `v_unified_outbox_current`| VIEW | event_id별 최신 상태 프로젝션 |
+| `worker_throughput_log`   | TABLE (Append-Only) | 핸들러별 처리량 기록 |
+
+### Worker (event_router_worker.py)
+
+| 핸들러 | event_type | 처리 내용 |
+|--------|------------|---------|
+| IngestHandler  | ingest    | B2 WORM + Whisper + 해시체인 |
+| NotionHandler  | notion    | Notion 동기화 |
+| ReconHandler   | reconcile | Phase 3 검증 엔진 실행 |
+| AlertHandler   | alert     | 카카오 알림톡 (NT-1/NT-2) |
+
+- 단일 Redis Stream: `voice:events`
+- 상태 전이: INSERT(보상 트랜잭션) — UPDATE 0
+- `logging.WARNING` 기준 (성공 조용히, 실패만 시끄럽게)
+
+### API (worker_health_api.py)
+
+| Endpoint | 반환 |
+|----------|------|
+| `GET /api/v2/worker/health` | Lag, DLQ 건수, 핸들러 처리량, Redis Stream 정보 |
+
+### Verification
+- `test_phase4_router.py` — T-01~T-06 (Append-Only + 라우팅 + DLQ 경로)
+
+---
+
+## Phase 5 진입 조건
+
+### Phase 5 후보 작업
+1. **대시보드 연동**: `GET /api/v3/reconcile/results` + `GET /api/v2/worker/health` → 프론트 패널
+2. **배치 스케줄러**: pg_cron 또는 cron으로 ReconHandler 자동 트리거 (새벽 3시)
+3. **canonical_day_fact REFRESH**: 검증 실행 전 자동 REFRESH 로직 추가
 
 ### Open Issues / Tech Debt
-- `overlap_rule` 초기 데이터: 실제 NHIS 급여유형 코드로 교체 필요 (현재 영문 ENUM)
-- `canonical_day_fact` REFRESH 주기: 수동 또는 pg_cron 설정 필요
-- `tolerance_ratio` 값: NHIS 공식 기준서 확인 후 조정 필요
+- `overlap_rule`: 실제 NHIS 급여유형 코드로 교체 필요 (현재 영문 ENUM)
+- `tolerance_ratio`: NHIS 공식 기준서 확인 후 조정 필요
 - Phase 2 Access Ledger (보류됨): MVP 완료 후 필요 시 재개
+- 기존 `redis_worker.py` / `backend/worker.py`: legacy — `event_router_worker.py`로 점진 이관
 
 ---
 
