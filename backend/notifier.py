@@ -10,10 +10,8 @@ Voice Guard — backend/notifier.py
 
 import hashlib
 import hmac
-import json
 import logging
 import os
-import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -42,9 +40,17 @@ ALIMTALK_OVERDUE_MINUTES = int(os.getenv("ALIMTALK_OVERDUE_MINUTES", "3"))
 # ══════════════════════════════════════════════════════════════════
 
 def _build_auth_header() -> str:
-    """Solapi HMAC-SHA256 인증 헤더 생성"""
-    date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    salt = uuid.uuid4().hex[:32]
+    """
+    Solapi HMAC-SHA256 인증 헤더 생성.
+
+    [강화 사항 — Phase 7]
+    - date: datetime.now(timezone.utc).isoformat() 동등 → UTC Z suffix 강제
+      시계 비동기화로 인한 인증 에러 방지
+    - salt: os.urandom(16).hex() → crypto.randomBytes(16) 동등, 정확히 32자 hex
+      uuid4 기반 salt 대비 진정한 CSPRNG 바이트 보장
+    """
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # UTC Z suffix
+    salt = os.urandom(16).hex()  # crypto.randomBytes(16) 동등: 32자 hex
     data = date + salt
     signature = hmac.new(
         SOLAPI_API_SECRET.encode("utf-8"),
@@ -55,6 +61,45 @@ def _build_auth_header() -> str:
         f"HMAC-SHA256 apiKey={SOLAPI_API_KEY}, "
         f"date={date}, salt={salt}, signature={signature}"
     )
+
+
+def _call_solapi_raw(phone: str, payload_json: dict, channel: str) -> None:
+    """
+    Solapi 직접 발송 (채널 분기 포함).
+    sharelink_worker 전용 — notification_log 기록 없음.
+
+    channel: 'kakao' → 알림톡, 'lms' → LMS, 'sms' → SMS
+    HTTP 오류 또는 네트워크 오류 시 예외 발생 (워커가 처리).
+    """
+    kakao_options = payload_json.get("kakaoOptions", {})
+    message: dict = {"to": phone.replace("-", "")}
+
+    if channel == "kakao" and kakao_options:
+        message["kakaoOptions"] = {
+            "senderKey":    kakao_options.get("senderKey", KAKAO_SENDER_KEY),
+            "templateCode": kakao_options.get("templateCode", ""),
+            "variables":    kakao_options.get("variables", {}),
+        }
+    elif channel == "lms":
+        message["type"]    = "LMS"
+        message["from"]    = os.getenv("SOLAPI_SENDER_PHONE", "")
+        message["subject"] = payload_json.get("subject", "")
+        message["text"]    = payload_json.get("text", "")
+    else:  # sms
+        message["type"] = "SMS"
+        message["from"] = os.getenv("SOLAPI_SENDER_PHONE", "")
+        message["text"] = payload_json.get("text", "")[:90]  # SMS 90자 제한
+
+    resp = requests.post(
+        f"{SOLAPI_BASE_URL}/messages/v4/send",
+        headers={
+            "Authorization": _build_auth_header(),
+            "Content-Type":  "application/json",
+        },
+        json={"message": message},
+        timeout=10,
+    )
+    resp.raise_for_status()
 
 
 def _call_solapi(phone: str, template_code: str, variables: dict) -> None:
