@@ -1,6 +1,6 @@
-# Voice Guard — Phase 4 Handover State
+# Voice Guard — Phase 6 Handover State
 **Date:** 2026-04-09  
-**Status:** COMPLETE — Ready for Phase 5
+**Status:** COMPLETE — Ready for Phase 7
 
 ---
 
@@ -116,18 +116,74 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY public.canonical_time_fact;
 
 ---
 
-## Phase 5 진입 조건
+## Phase 6 산출물 (오늘 구축)
 
-### Phase 5 후보 작업
-1. **대시보드 연동**: `GET /api/v3/reconcile/results` + `GET /api/v2/worker/health` → 프론트 패널
-2. **배치 스케줄러**: pg_cron 또는 cron으로 ReconHandler 자동 트리거 (새벽 3시)
-3. **canonical_day_fact REFRESH**: 검증 실행 전 자동 REFRESH 로직 추가
+### DB (schema_v13_phase6.sql)
+
+| 객체 | 유형 | 역할 |
+|------|------|------|
+| `handover_utterance_ledger` | TABLE (Append-Only) | 수시 발화 기록 원장. `idempotency_key` UNIQUE NOT NULL (서버 결정론적 sha256) |
+| `handover_report_ledger`    | TABLE (Append-Only) | 보고서 원장. `gemini_json/raw_fallback/notion_snapshot` 봉인 + `expires_at` trigger_at+30분 |
+| `handover_ack_ledger`       | TABLE (Append-Only) | 법적 수신 확인 원장. `device_id/ack_at` 기록 + UPDATE/DELETE 완전 차단 |
+
+**트리거 9개:**
+- `handover_utterance_ledger`: UPDATE/DELETE/TRUNCATE 완전 차단 (3개)
+- `handover_report_ledger`: 봉인 필드 UPDATE 차단 + DELETE/TRUNCATE 차단 (2+2개)
+- `handover_ack_ledger`: UPDATE/DELETE/TRUNCATE 완전 차단 (3개)
+
+**핵심 설계:**
+- `idempotency_key = sha256(worker_id || shift_date)` — 클라이언트 키 무시, 서버 강제 생성
+- `expires_at GENERATED ALWAYS AS (trigger_at + INTERVAL '30 minutes') STORED` — 무한 PENDING 고착 방지
+- `gemini_json/raw_fallback/notion_snapshot`: NULL→값 SET은 허용, 이후 변경 차단 (봉인)
+
+### 신규 파일
+
+| 파일 | 역할 |
+|------|------|
+| `handover_compile_handler.py` | HandoverCompileHandler: Gemini JSON 스키마 강제 + RAW_FALLBACK + Notion 2-mode + NT-5 알림 |
+| `handover_api_v6.py`          | Phase 6 API: POST trigger (멱등성) / POST utterance / PATCH ack (tamper detection) / GET report |
+| `test_phase6_handover.py`     | T-01~T-10 (25 assertions, 25 PASSED) |
+
+### 수정 파일
+
+| 파일 | 변경 내용 |
+|------|---------|
+| `event_router_worker.py` | `HandoverCompileHandler` 등록 (`handover_compile` event_type 라우팅) |
+| `handover_handler.py`    | TTS 완전 제거: `_upload_tts_to_b2` 삭제, OpenAI TTS 코드 제거 (tts_* 컬럼은 NULL 기록) |
+
+### API (handover_api_v6.py)
+
+| Endpoint | 설명 |
+|----------|------|
+| `POST /api/v6/handover/utterance`   | 수시 발화 기록 (서버 결정론적 멱등성 키) |
+| `POST /api/v6/handover/trigger`     | 보고서 생성 트리거 (sha256 멱등성, 중복 409) |
+| `PATCH /api/v6/handover/{id}/ack`   | 법적 ACK + Notion 재조회 위변조 감지 (`tamper_detected`) |
+| `GET /api/v6/handover/report/{id}`  | 보고서 상태 조회 |
+
+### HandoverCompileHandler (handover_compile_handler.py)
+
+| 기능 | 구현 |
+|------|------|
+| Gemini JSON 스키마 강제 | `responseMimeType: application/json` + `responseSchema` 4개 필드 |
+| Gemini 장애 Fallback | `except` → `generation_mode='RAW_FALLBACK'` + `⚠️ 경고 헤더` |
+| Notion 2-mode 템플릿 | LLM: 섹션 블록(🚨/👤/📝/✅) / Fallback: 경고 헤더 + 원문 (빈 블록 금지) |
+| NT-5 관리자 알림 | Gemini 장애 시 `unified_outbox`에 'alert' PENDING INSERT |
+| 만료 감지 | `expires_at < NOW()` → `status=EXPIRED` 전환 후 처리 중단 |
+
+### Verification
+- `test_phase6_handover.py` — **T-01~T-10 (25 assertions, 25 PASSED)**
+
+---
+
+## Phase 7 진입 조건
 
 ### Open Issues / Tech Debt
 - `overlap_rule`: 실제 NHIS 급여유형 코드로 교체 필요 (현재 영문 ENUM)
 - `tolerance_ratio`: NHIS 공식 기준서 확인 후 조정 필요
+- `handover_report_ledger.status=EXPIRED` 자동 전환 배치: pg_cron 스케줄 추가
 - Phase 2 Access Ledger (보류됨): MVP 완료 후 필요 시 재개
 - 기존 `redis_worker.py` / `backend/worker.py`: legacy — `event_router_worker.py`로 점진 이관
+- `ingest_api.py`에 `handover_api_v6.router` 마운트 필요
 
 ---
 

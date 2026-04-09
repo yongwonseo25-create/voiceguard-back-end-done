@@ -20,8 +20,7 @@ Voice Guard — Phase 5 HandoverHandler (handover_handler.py)
 import hashlib
 import logging
 import os
-from datetime import datetime, timezone, timedelta
-from typing import Optional
+from datetime import datetime
 from uuid import uuid4
 
 import boto3
@@ -29,6 +28,8 @@ import httpx
 from botocore.client import Config
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+
+# [Phase 6] TTS 라이브러리(pyttsx3/gTTS/OpenAI TTS) 백엔드 파이프라인 완전 제거.
 
 load_dotenv()
 
@@ -45,7 +46,7 @@ B2_APPLICATION_KEY = os.getenv("B2_APPLICATION_KEY")
 B2_BUCKET_NAME     = os.getenv("B2_BUCKET_NAME", "voice-guard-korea")
 B2_ENDPOINT_URL    = os.getenv("B2_ENDPOINT_URL", "https://s3.us-west-004.backblazeb2.com")
 ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
+# OPENAI_API_KEY: Phase 6에서 TTS 완전 제거 — 미사용
 WORM_YEARS         = 5
 
 # Haiku: CLAUDE.md §2 "Evaluator & Formatting" 비용 최적화 모델
@@ -337,50 +338,12 @@ def _build_raw_fallback_brief(records: list[dict], anomalies: list[dict]) -> str
 
 
 # ══════════════════════════════════════════════════════════════
-# Step 4: TTS 오디오 생성 + B2 WORM 업로드 (선택적)
+# [Phase 6] TTS 완전 제거
+# _upload_tts_to_b2 (OpenAI TTS) 삭제 — pyttsx3/gTTS 미사용 확인됨.
+# 인수인계는 텍스트(Notion) + 카카오 알림톡으로 전달한다.
+# shift_handover_ledger.tts_object_key / tts_sha256 컬럼은
+# 스키마 불변 원칙에 의해 컬럼 자체는 유지하되 NULL로 기록된다.
 # ══════════════════════════════════════════════════════════════
-
-async def _upload_tts_to_b2(brief_text: str, handover_id: str) -> tuple[Optional[str], Optional[str]]:
-    """
-    OpenAI TTS 로 오디오를 생성하고 B2 WORM 에 업로드한다.
-    OPENAI_API_KEY 미설정 또는 모든 오류 → (None, None) 반환.
-    TTS 실패는 브리핑 전체를 막지 않는다.
-    """
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY 미설정 — TTS 생략")
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            "https://api.openai.com/v1/audio/speech",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type":  "application/json",
-            },
-            json={
-                "model": "tts-1",
-                "input": brief_text[:4096],
-                "voice": "nova",
-            },
-        )
-        resp.raise_for_status()
-        audio_bytes = resp.content
-
-    tts_sha256 = hashlib.sha256(audio_bytes).hexdigest()
-    date_pfx   = datetime.now(timezone.utc).strftime("%Y/%m/%d")
-    b2_key     = f"handover_tts/{date_pfx}/{handover_id}.mp3"
-    retain     = datetime.now(timezone.utc) + timedelta(days=365 * WORM_YEARS)
-
-    b2 = _get_b2()
-    b2.put_object(
-        Bucket=B2_BUCKET_NAME,
-        Key=b2_key,
-        Body=audio_bytes,
-        ContentType="audio/mpeg",
-        ObjectLockMode="COMPLIANCE",
-        ObjectLockRetainUntilDate=retain,
-    )
-
-    return b2_key, tts_sha256
 
 
 # ══════════════════════════════════════════════════════════════
@@ -462,16 +425,9 @@ async def handover_handler(event_id: str, payload: dict, attempt_num: int) -> No
 
     brief_sha256 = hashlib.sha256(brief_text.encode("utf-8")).hexdigest()
 
-    # ── 5. TTS 생성 + B2 업로드 (실패 허용) ──────────────────
-    handover_id  = str(uuid4())
-    tts_key      = None
-    tts_sha256   = None
-    try:
-        tts_key, tts_sha256 = await _upload_tts_to_b2(brief_text, handover_id)
-    except Exception as e:
-        logger.warning("[HandoverHandler] TTS 생성 생략: %s", e)
-
-    # ── 6. shift_handover_ledger INSERT (WORM 봉인) ───────────
+    # ── 5. shift_handover_ledger INSERT (WORM 봉인) ──────────
+    # [Phase 6] TTS 제거: tts_object_key/tts_sha256 NULL 기록 (컬럼 스키마 불변 유지)
+    handover_id = str(uuid4())
     with _engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO public.shift_handover_ledger (
@@ -483,21 +439,19 @@ async def handover_handler(event_id: str, payload: dict, attempt_num: int) -> No
                 :id, :fid, :sstart, :send,
                 :tmode, :src_cnt, :ano_cnt,
                 :brief, :sha256, :gmode,
-                :tts_key, :tts_sha256
+                NULL, NULL
             )
         """), {
-            "id":        handover_id,
-            "fid":       facility_id,
-            "sstart":    shift_start,
-            "send":      shift_end,
-            "tmode":     trigger_mode,
-            "src_cnt":   len(records),
-            "ano_cnt":   len(anomalies),
-            "brief":     brief_text,
-            "sha256":    brief_sha256,
-            "gmode":     generation_mode,
-            "tts_key":   tts_key,
-            "tts_sha256":tts_sha256,
+            "id":      handover_id,
+            "fid":     facility_id,
+            "sstart":  shift_start,
+            "send":    shift_end,
+            "tmode":   trigger_mode,
+            "src_cnt": len(records),
+            "ano_cnt": len(anomalies),
+            "brief":   brief_text,
+            "sha256":  brief_sha256,
+            "gmode":   generation_mode,
         })
 
 

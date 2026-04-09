@@ -297,13 +297,29 @@ async def _alert_handler(event_id: str, payload: dict, attempt_num: int):
 # ══════════════════════════════════════════════════════════════
 
 from handover_handler import handover_handler as _handover_handler_fn, check_undelivered_handovers
+from handover_compile_handler import handover_compile_handler as _handover_compile_handler_fn
+
+
+# ══════════════════════════════════════════════════════════════
+# HandoverCompileHandler: Phase 6 Gemini 컴파일 핸들러
+# ══════════════════════════════════════════════════════════════
+
+async def _handover_compile_handler(event_id: str, payload: dict, attempt_num: int):
+    """
+    event_type='handover_compile' — Phase 6 인수인계 보고서 컴파일.
+    handover_compile_handler.py 의 handover_compile_handler() 위임.
+    Gemini 장애 → RAW_FALLBACK 자동 전환 + NT-5 관리자 알림톡 (내부 처리).
+    """
+    await _handover_compile_handler_fn(event_id, payload, attempt_num)
+
 
 _HANDLERS = {
-    "ingest":           (_ingest_handler,      "IngestHandler"),
-    "notion":           (_notion_handler,      "NotionHandler"),
-    "reconcile":        (_recon_handler,       "ReconHandler"),
-    "alert":            (_alert_handler,       "AlertHandler"),
-    "handover_trigger": (_handover_handler_fn, "HandoverHandler"),
+    "ingest":            (_ingest_handler,           "IngestHandler"),
+    "notion":            (_notion_handler,           "NotionHandler"),
+    "reconcile":         (_recon_handler,            "ReconHandler"),
+    "alert":             (_alert_handler,            "AlertHandler"),
+    "handover_trigger":  (_handover_handler_fn,      "HandoverHandler"),
+    "handover_compile":  (_handover_compile_handler, "HandoverCompileHandler"),
 }
 
 
