@@ -37,6 +37,7 @@ from sqlalchemy.exc import IntegrityError
 from care_plan_api import router as care_plan_router
 from billing_api import router as billing_router
 from reconciliation_api import router as reconciliation_router
+from worker_health_api import router as worker_health_router
 
 load_dotenv()
 
@@ -89,6 +90,9 @@ app.include_router(billing_router)
 
 # ── Phase 3 라우터: 3각 검증 엔진 ──────────────────────────
 app.include_router(reconciliation_router)
+
+# ── Phase 4 라우터: 워커 헬스 모니터링 ─────────────────────
+app.include_router(worker_health_router)
 
 # ── 응답 모델 ────────────────────────────────────────────────
 class IngestResponse(BaseModel):
