@@ -288,7 +288,7 @@ async def list_rpa_logs(
     if _engine is None:
         raise HTTPException(503, "DB 미연결")
 
-    where = "WHERE r.batch_id = :bid" if batch_id else ""
+    where = "WHERE r.batch_id = :bid" if batch_id else ""  # nosec B608 — hardcoded SQL fragment
     params = {"bid": batch_id, "lim": limit}
 
     try:

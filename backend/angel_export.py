@@ -199,7 +199,7 @@ async def preview_export(
     if _engine is None:
         raise HTTPException(503, "DB 미연결")
 
-    where = "AND e.facility_id = :fid" if facility_id else ""
+    where = "AND e.facility_id = :fid" if facility_id else ""  # nosec B608 — hardcoded SQL fragment
     params = {"fid": facility_id} if facility_id else {}
 
     try:
@@ -222,7 +222,7 @@ async def preview_export(
                     FROM angel_review_event
                     ORDER BY ledger_id, created_at DESC
                 ) latest
-                JOIN evidence_ledger e
+                JOIN v_evidence_sealed e
                     ON e.id = latest.ledger_id
                 WHERE latest.status = 'APPROVED_FOR_EXPORT'
                 {where}
@@ -290,7 +290,7 @@ async def export_zip(body: ExportRequest):
                     FROM angel_review_event
                     ORDER BY ledger_id, created_at DESC
                 ) latest
-                JOIN evidence_ledger e
+                JOIN v_evidence_sealed e
                     ON e.id = latest.ledger_id
                 WHERE latest.status = 'APPROVED_FOR_EXPORT'
                   AND e.facility_id = :fid
@@ -464,7 +464,7 @@ async def list_batches(
     if _engine is None:
         raise HTTPException(503, "DB 미연결")
 
-    where = "WHERE facility_id = :fid" if facility_id else ""
+    where = "WHERE facility_id = :fid" if facility_id else ""  # nosec B608 — hardcoded SQL fragment
     params = {"fid": facility_id, "lim": limit}
 
     try:

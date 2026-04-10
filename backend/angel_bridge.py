@@ -77,7 +77,7 @@ async def list_pending(
         where_clauses.append("latest.status = :sf")
         params["sf"] = status_filter
 
-    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""  # nosec B608 — hardcoded SQL fragments only, user values bound via params dict
 
     try:
         with _engine.connect() as conn:
@@ -105,7 +105,7 @@ async def list_pending(
                     FROM angel_review_event
                     ORDER BY ledger_id, created_at DESC
                 ) latest
-                JOIN evidence_ledger e ON e.id = latest.ledger_id
+                JOIN v_evidence_sealed e ON e.id = latest.ledger_id
                 {where_sql}
                 ORDER BY latest.created_at DESC
                 LIMIT :lim
@@ -269,16 +269,22 @@ async def get_coverage(
     if _engine is None:
         raise HTTPException(503, "DB 미연결")
 
-    where = "WHERE e.facility_id = :fid" if facility_id else ""
-    params = {"fid": facility_id} if facility_id else {}
+    # ── [TD-06] WHERE 1=1 안전 동적 빌더 ────────────────────────
+    # 기존 코드는 facility_id 미지정 시 `FROM evidence_ledger e AND ...`로
+    # SQL 문법 오류 → 500 에러 발생. 조건 배열 + 1=1 패턴으로 차단.
+    filters = ["1=1", "e.care_type IS NOT NULL"]
+    params: dict = {}
+    if facility_id:
+        filters.append("e.facility_id = :fid")
+        params["fid"] = facility_id
+    where_sql = "WHERE " + " AND ".join(filters)  # nosec B608 — hardcoded fragments only
 
     try:
         with _engine.connect() as conn:
             rows = conn.execute(text(f"""
                 SELECT e.beneficiary_id, e.care_type
                 FROM evidence_ledger e
-                {where}
-                AND e.care_type IS NOT NULL
+                {where_sql}
                 ORDER BY e.beneficiary_id
             """), params).fetchall()
     except Exception as e:
@@ -334,8 +340,8 @@ async def get_detail(ledger_id: str):
                        transcript_text,
                        worm_bucket, worm_object_key, worm_retain_until,
                        is_flagged, gps_lat, gps_lon,
-                       audio_size_kb
-                FROM evidence_ledger
+                       audio_size_kb, is_sealed, sealed_at
+                FROM v_evidence_sealed
                 WHERE id = :lid
             """), {"lid": ledger_id}).fetchone()
 

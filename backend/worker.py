@@ -34,19 +34,28 @@ from notifier import (
     ADMIN_PHONE, DEFAULT_FACILITY_PHONE,
     ALIMTALK_OVERDUE_MINUTES,
 )
+from gemini_processor import call_gemini, call_gemini_care_record
+from env_guard import check_env_vars
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 logger = logging.getLogger("voice_guard.worker")
 
+# ── [TD-01/TD-05] 환경변수 강제화: 모듈 로드 시점에 즉시 검증 ─────
+# SECRET_KEY 기본값('CHANGE_ME') 또는 필수 변수 누락 시 RuntimeError 발생
+# → 워커 기동 자체가 차단되어 무효 증거 봉인 원천 차단.
+check_env_vars("worm", "ai", "alimtalk")
+
 DATABASE_URL       = os.getenv("DATABASE_URL")
 REDIS_URL          = os.getenv("REDIS_URL", "redis://localhost:6379")
 REDIS_STREAM       = "voice:ingest"
+REDIS_CARE_STREAM  = "care:records"       # 6대 의무기록 스트림 (신규)
 REDIS_SSE_CHANNEL  = "sse:dashboard"
 CONSUMER_GROUP     = "voice-guard-workers"
 CONSUMER_NAME      = f"worker-{os.getpid()}"
-SERVER_SECRET      = os.getenv("SECRET_KEY", "CHANGE_ME").encode()
+# env_guard가 위에서 SECRET_KEY 존재/유효성을 이미 검증했으므로 안전
+SERVER_SECRET      = os.getenv("SECRET_KEY", "").encode()
 B2_KEY_ID          = os.getenv("B2_KEY_ID")
 B2_APPLICATION_KEY = os.getenv("B2_APPLICATION_KEY")
 B2_BUCKET_NAME     = os.getenv("B2_BUCKET_NAME", "voice-guard-korea")
@@ -218,16 +227,34 @@ async def process(redis: aioredis.Redis, ledger_id: str, msg_id: str):
             meta.get("beneficiary_id",""), meta.get("shift_id",""),
             meta.get("server_ts",""), audio_sha256, transcript_sha256, b2_key)
 
-        # Atomic UPDATE
+        # ── [TD-02] Append-Only 봉인: evidence_ledger UPDATE 폐지 ──
+        # 봉인 결과는 evidence_seal_event에 INSERT (Append-Only).
+        # ON CONFLICT (ledger_id) DO NOTHING — 워커 재시도 시 멱등 보장.
+        # 원본 evidence_ledger는 단 한 번 INSERT 후 영원히 불변.
         with engine.begin() as conn:
             conn.execute(text("""
-                UPDATE evidence_ledger SET
-                    audio_sha256=:a, transcript_sha256=:t, chain_hash=:c,
-                    transcript_text=:tx, worm_bucket=:bkt,
-                    worm_object_key=:bk, worm_retain_until=:ret
-                WHERE id=:lid
-            """), {"a":audio_sha256,"t":transcript_sha256,"c":chain,"tx":transcript,
-                   "bkt":B2_BUCKET_NAME,"bk":b2_key,"ret":retain,"lid":ledger_id})
+                INSERT INTO evidence_seal_event (
+                    id, ledger_id, audio_sha256, transcript_sha256,
+                    chain_hash, transcript_text,
+                    worm_bucket, worm_object_key, worm_retain_until,
+                    sealed_at
+                ) VALUES (
+                    gen_random_uuid(), :lid, :a, :t,
+                    :c, :tx,
+                    :bkt, :bk, :ret,
+                    NOW()
+                )
+                ON CONFLICT (ledger_id) DO NOTHING
+            """), {
+                "lid": ledger_id,
+                "a":   audio_sha256,
+                "t":   transcript_sha256,
+                "c":   chain,
+                "tx":  transcript,
+                "bkt": B2_BUCKET_NAME,
+                "bk":  b2_key,
+                "ret": retain,
+            })
             conn.execute(text(
                 "UPDATE outbox_events SET status='done',processed_at=NOW() WHERE id=:id"),
                 {"id": outbox_id})
@@ -236,6 +263,43 @@ async def process(redis: aioredis.Redis, ledger_id: str, msg_id: str):
             await redis.xack(REDIS_STREAM, CONSUMER_GROUP, msg_id)
 
         logger.info(f"[WORKER] ✅ 봉인 완료: ledger={ledger_id}")
+
+        # ── Gemini 정제 → Notion 인수인계 1장 템플릿 큐 등록 ────────
+        # 봉인 완료 후 비치명적으로 실행 — 실패해도 증거 봉인은 이미 완료
+        try:
+            gemini_meta = {
+                "beneficiary_id": meta.get("beneficiary_id", ""),
+                "facility_id":    meta.get("facility_id", ""),
+                "shift_id":       meta.get("shift_id", ""),
+                "report_date":    meta.get("server_ts", "")[:10],  # YYYY-MM-DD
+            }
+            gemini_json = await call_gemini(transcript, gemini_meta)
+
+            notion_payload = json.dumps({
+                "ledger_id":       ledger_id,
+                "facility_id":     meta.get("facility_id", ""),
+                "beneficiary_id":  meta.get("beneficiary_id", ""),
+                "shift_id":        meta.get("shift_id", ""),
+                "ingested_at":     meta.get("server_ts", ""),
+                "chain_hash":      chain,
+                "worm_object_key": b2_key,
+                "gemini_json":     gemini_json,   # 5-Block 라우팅 트리거
+            }, ensure_ascii=False)
+
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO notion_sync_outbox
+                        (id, ledger_id, status, attempts, payload, created_at)
+                    VALUES
+                        (gen_random_uuid(), :lid, 'pending', 0,
+                         CAST(:payload AS jsonb), NOW())
+                    ON CONFLICT DO NOTHING
+                """), {"lid": ledger_id, "payload": notion_payload})
+
+            logger.info(f"[WORKER] Notion 인수인계 템플릿 큐 등록: ledger={ledger_id}")
+        except Exception as e:
+            # notion 큐 등록 실패는 워닝만 — 증거 봉인은 이미 완료됨
+            logger.warning(f"[WORKER] Notion 큐 등록 실패 (비치명적): {e}")
 
         try:
             await redis.publish(REDIS_SSE_CHANNEL, json.dumps({"event":"evidence_sealed",
@@ -255,6 +319,121 @@ async def process(redis: aioredis.Redis, ledger_id: str, msg_id: str):
                 """), {"msg": str(e)[:500], "d": delay, "id": outbox_id})
         except Exception: pass
         # XACK 없음 → XAUTOCLAIM 재수령 (시나리오 A)
+
+# ══════════════════════════════════════════════════════════════════
+# 6대 의무기록: care_record_outbox 단일 레코드 처리 (신규)
+# ══════════════════════════════════════════════════════════════════
+
+async def process_care_record(redis: aioredis.Redis, record_id: str, msg_id: str) -> None:
+    """
+    care_record_outbox 1건 처리.
+
+    흐름:
+      1. care_record_outbox + care_record_ledger 조회
+      2. call_gemini_care_record() → 6대 의무기록 구조화
+      3. notion_sync_outbox INSERT (care_record_json 키) → notion_sync 워커 인계
+      4. care_record_outbox status='done'
+    """
+    if not engine:
+        return
+
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT o.id AS oid, o.attempts, o.payload, o.status,
+                   r.facility_id, r.beneficiary_id, r.caregiver_id,
+                   r.raw_voice_text, r.recorded_at
+            FROM care_record_outbox o
+            JOIN care_record_ledger r ON r.id = o.record_id
+            WHERE o.record_id = :rid
+              AND o.status IN ('pending', 'processing')
+            LIMIT 1
+        """), {"rid": record_id}).fetchone()
+
+    if not row:
+        if msg_id != "db-poll":
+            await redis.xack(REDIS_CARE_STREAM, CONSUMER_GROUP, msg_id)
+        return
+
+    outbox_id = str(row.oid)
+    attempts  = row.attempts
+
+    # DLQ 판단
+    if attempts >= MAX_ATTEMPTS:
+        if not engine:
+            return
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE care_record_outbox SET status='dlq', processed_at=NOW() WHERE id=:id"
+            ), {"id": outbox_id})
+        logger.critical(f"[CARE-WORKER] MAX_ATTEMPTS 초과 DLQ: record={record_id}")
+        if msg_id != "db-poll":
+            await redis.xack(REDIS_CARE_STREAM, CONSUMER_GROUP, msg_id)
+        return
+
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE care_record_outbox SET status='processing', attempts=attempts+1 WHERE id=:id"
+        ), {"id": outbox_id})
+
+    logger.info(f"[CARE-WORKER] 처리: record={record_id} attempt={attempts+1}/{MAX_ATTEMPTS}")
+
+    try:
+        metadata = {
+            "beneficiary_id": row.beneficiary_id or "",
+            "facility_id":    row.facility_id    or "",
+            "recorded_at":    row.recorded_at.isoformat() if row.recorded_at else "",
+        }
+
+        # Gemini 6대 의무기록 정제 (실패 시 기본값 JSON 반환 — 파이프라인 블로킹 금지)
+        care_record_json = await call_gemini_care_record(
+            raw_voice_text=row.raw_voice_text or "",
+            metadata=metadata,
+        )
+
+        # notion_sync_outbox에 care_record_json 키로 등록 → notion_sync 워커 인계
+        notion_payload = json.dumps({
+            "record_id":      record_id,
+            "facility_id":    row.facility_id    or "",
+            "beneficiary_id": row.beneficiary_id or "",
+            "care_record_json": care_record_json,  # 3-way 라우팅 트리거
+        }, ensure_ascii=False)
+
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO notion_sync_outbox
+                    (id, ledger_id, status, attempts, payload, created_at)
+                VALUES
+                    (gen_random_uuid(), :lid, 'pending', 0,
+                     CAST(:payload AS jsonb), NOW())
+                ON CONFLICT DO NOTHING
+            """), {
+                "lid":     record_id,   # care record ID를 ledger_id 컬럼 재활용
+                "payload": notion_payload,
+            })
+
+            conn.execute(text(
+                "UPDATE care_record_outbox SET status='done', processed_at=NOW() WHERE id=:id"
+            ), {"id": outbox_id})
+
+        if msg_id != "db-poll":
+            await redis.xack(REDIS_CARE_STREAM, CONSUMER_GROUP, msg_id)
+
+        logger.info(f"[CARE-WORKER] ✅ 완료: record={record_id}")
+
+    except Exception as e:
+        logger.error(f"[CARE-WORKER] 실패 attempt={attempts+1}: {e}")
+        delay = BACKOFF[min(attempts, len(BACKOFF) - 1)]
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    UPDATE care_record_outbox
+                    SET status='pending', error_message=:msg,
+                        next_retry_at=NOW()+(:d||' seconds')::INTERVAL
+                    WHERE id=:id AND status='processing'
+                """), {"msg": str(e)[:500], "d": delay, "id": outbox_id})
+        except Exception:
+            pass
+
 
 # ── NT-1: 미기록 임박 건 주기 점검 ──────────────────────────────
 async def check_overdue():
@@ -321,11 +500,38 @@ async def poll_fallback(redis: aioredis.Redis):
     except Exception as e:
         logger.error(f"[FALLBACK] {e}")
 
+async def poll_care_fallback(redis: aioredis.Redis):
+    """시나리오 B (care:records): Redis 장애 시 care_record_outbox 직접 폴링"""
+    if not engine:
+        return
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT record_id FROM care_record_outbox
+                WHERE status='pending' AND attempts < :m
+                  AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                ORDER BY created_at LIMIT 5
+            """), {"m": MAX_ATTEMPTS}).fetchall()
+        for row in rows:
+            await process_care_record(redis, str(row.record_id), "db-poll")
+    except Exception as e:
+        logger.error(f"[CARE-FALLBACK] {e}")
+
+
 async def main():
     redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+
+    # voice:ingest Consumer Group
     try:
         await redis.xgroup_create(REDIS_STREAM, CONSUMER_GROUP, id="0", mkstream=True)
         logger.info("[WORKER] Consumer Group 생성.")
+    except aioredis.ResponseError as e:
+        if "BUSYGROUP" not in str(e): raise
+
+    # care:records Consumer Group (신규)
+    try:
+        await redis.xgroup_create(REDIS_CARE_STREAM, CONSUMER_GROUP, id="0", mkstream=True)
+        logger.info("[WORKER] care:records Consumer Group 생성.")
     except aioredis.ResponseError as e:
         if "BUSYGROUP" not in str(e): raise
 
@@ -347,13 +553,16 @@ async def main():
             except Exception as e:
                 logger.error(f"[AUTOCLAIM] {e}")
 
-            # XREADGROUP: 새 메시지
+            # XREADGROUP: 새 메시지 (voice:ingest + care:records 동시 구독)
             messages = await redis.xreadgroup(
                 CONSUMER_GROUP, CONSUMER_NAME,
-                {REDIS_STREAM: ">"}, count=5, block=BLOCK_MS)
+                {REDIS_STREAM: ">", REDIS_CARE_STREAM: ">"},
+                count=5, block=BLOCK_MS,
+            )
 
             if not messages:
                 await poll_fallback(redis)
+                await poll_care_fallback(redis)
                 # NT-1: 약 30초마다 미기록 임박 건 알림톡 점검
                 overdue_tick += 1
                 if overdue_tick >= 6:
@@ -361,11 +570,22 @@ async def main():
                     await check_overdue()
                 continue
 
-            for _, msgs in messages:
+            for stream_name, msgs in messages:
                 for msg_id, fields in msgs:
-                    lid = fields.get("ledger_id","")
-                    if lid: await process(redis, lid, msg_id)
-                    else: await redis.xack(REDIS_STREAM, CONSUMER_GROUP, msg_id)
+                    if stream_name == REDIS_CARE_STREAM:
+                        # care:records 스트림 처리
+                        rid = fields.get("record_id", "")
+                        if rid:
+                            await process_care_record(redis, rid, msg_id)
+                        else:
+                            await redis.xack(REDIS_CARE_STREAM, CONSUMER_GROUP, msg_id)
+                    else:
+                        # voice:ingest 스트림 처리 (기존)
+                        lid = fields.get("ledger_id", "")
+                        if lid:
+                            await process(redis, lid, msg_id)
+                        else:
+                            await redis.xack(REDIS_STREAM, CONSUMER_GROUP, msg_id)
 
         except asyncio.CancelledError:
             break

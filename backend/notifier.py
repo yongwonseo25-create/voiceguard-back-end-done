@@ -30,9 +30,51 @@ ALIMTALK_TPL_NT1       = os.getenv("ALIMTALK_TPL_NT1", "")   # 미기록 임박 
 ALIMTALK_TPL_NT2       = os.getenv("ALIMTALK_TPL_NT2", "")   # DLQ 긴급 알림
 ALIMTALK_TPL_NT3       = os.getenv("ALIMTALK_TPL_NT3", "")   # 현장 확인 요청
 
+# ── [Phase 7-v7] 사령관 원칙 #4 — 인프라팀 추후 처리용 더미 템플릿 ──
+# 실 템플릿 코드는 카카오 비즈메시지 승인 후 환경변수로 주입.
+ALIMTALK_TPL_EMERGENCY   = os.getenv("ALIMTALK_TPL_EMERGENCY",   "TPL_EMERGENCY_DUMMY_PENDING_APPROVAL")
+ALIMTALK_TPL_SHIFT_GROUP = os.getenv("ALIMTALK_TPL_SHIFT_GROUP", "TPL_SHIFT_GROUP_DUMMY_PENDING_APPROVAL")
+
+# ── [Phase 7-v7] 사령관 원칙 #1 — 긴급 수신자: 원장 + 관리자 fan-out ──
+EMERGENCY_RECIPIENTS = [
+    p.strip() for p in os.getenv("EMERGENCY_RECIPIENTS", "").split(",") if p.strip()
+]
+
+# ── [Phase 7-v7] 교대조 명단 (백엔드 단독 보유, FE 노출 금지) ──
+SHIFT_GROUP_DAY     = [p.strip() for p in os.getenv("SHIFT_GROUP_DAY",     "").split(",") if p.strip()]
+SHIFT_GROUP_EVENING = [p.strip() for p in os.getenv("SHIFT_GROUP_EVENING", "").split(",") if p.strip()]
+SHIFT_GROUP_NIGHT   = [p.strip() for p in os.getenv("SHIFT_GROUP_NIGHT",   "").split(",") if p.strip()]
+
 ADMIN_PHONE            = os.getenv("ADMIN_PHONE", "")
 DEFAULT_FACILITY_PHONE = os.getenv("DEFAULT_FACILITY_PHONE", "")
 ALIMTALK_OVERDUE_MINUTES = int(os.getenv("ALIMTALK_OVERDUE_MINUTES", "3"))
+
+
+# ══════════════════════════════════════════════════════════════════
+# [Phase 7-v7] 교대조 100% 자동 산정 — FE 개입 절대 금지
+# ══════════════════════════════════════════════════════════════════
+
+def resolve_shift_code_auto(now: Optional[datetime] = None) -> str:
+    """
+    사령관 원칙 #2: shiftCode는 100% AUTO. 서버 시계 단일 진실원.
+        DAY     06:00 ≤ h < 14:00
+        EVENING 14:00 ≤ h < 22:00
+        NIGHT   22:00 ≤ h < 06:00
+    """
+    h = (now or datetime.now()).hour
+    if 6 <= h < 14:
+        return "DAY"
+    if 14 <= h < 22:
+        return "EVENING"
+    return "NIGHT"
+
+
+def resolve_shift_recipients(shift_code: str) -> list:
+    return {
+        "DAY":     SHIFT_GROUP_DAY,
+        "EVENING": SHIFT_GROUP_EVENING,
+        "NIGHT":   SHIFT_GROUP_NIGHT,
+    }.get(shift_code, [])
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -249,3 +291,41 @@ def send_alimtalk(
         except Exception as log_err:
             logger.error(f"[NOTIFIER] 실패 이력 기록 오류: {log_err}")
         return False
+
+
+# ══════════════════════════════════════════════════════════════════
+# [Phase 7-v7] fan-out 공통 송신기
+# CLAUDE.md §0 "이중 노동 제로" — emergency / shift-group 양 엔드포인트 공유
+# ══════════════════════════════════════════════════════════════════
+
+def fanout_alimtalk(
+    engine,
+    phones: list,
+    template_code: str,
+    variables: dict,
+    trigger_type: str,
+):
+    """
+    여러 수신자에게 동일 알림톡을 fan-out 발송.
+    Returns: (성공, 실패) 카운트 튜플
+    """
+    sent = 0
+    failed = 0
+    for phone in phones:
+        ok = send_alimtalk(
+            engine=engine,
+            phone=phone,
+            template_code=template_code,
+            variables=variables,
+            trigger_type=trigger_type,
+            ledger_id=None,
+        )
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+    logger.info(
+        f"[FANOUT] trigger={trigger_type} sent={sent} failed={failed} "
+        f"template={template_code}"
+    )
+    return sent, failed

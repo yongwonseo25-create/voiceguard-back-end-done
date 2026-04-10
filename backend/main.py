@@ -22,17 +22,29 @@ from uuid import uuid4
 
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
-from notifier import send_alimtalk, ALIMTALK_TPL_NT3, DEFAULT_FACILITY_PHONE
+from notifier import (
+    send_alimtalk,
+    ALIMTALK_TPL_NT3,
+    DEFAULT_FACILITY_PHONE,
+    # ── Phase 7-v7 ────────────────────────────────────────────────
+    ALIMTALK_TPL_EMERGENCY,
+    ALIMTALK_TPL_SHIFT_GROUP,
+    EMERGENCY_RECIPIENTS,
+    resolve_shift_code_auto,
+    resolve_shift_recipients,
+    fanout_alimtalk,
+)
 from angel_bridge import router as angel_router, init_angel_bridge
 from angel_export import router as angel_export_router, init_angel_export
 from angel_rpa import router as angel_rpa_router, init_angel_rpa
+from env_guard import check_env_vars
 
 load_dotenv()
 
@@ -42,11 +54,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("voice_guard.main")
 
+# ── [TD-01/TD-05] 환경변수 강제화: 모듈 로드 시점 즉시 검증 ────────
+# SECRET_KEY='CHANGE_ME' 또는 핵심 API 키 누락 시 RuntimeError로 즉시 종료.
+# uvicorn 기동 자체가 차단되어 무효 증거 인프라 가동 원천 차단.
+check_env_vars("worm", "ai", "notion", "alimtalk")
+
 # ── 설정 ──────────────────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
-REDIS_SSE_CHANNEL = "sse:dashboard"          # Pub/Sub 채널 (워커 → SSE)
-REDIS_STREAM  = "voice:ingest"
+REDIS_SSE_CHANNEL  = "sse:dashboard"          # Pub/Sub 채널 (워커 → SSE)
+REDIS_STREAM       = "voice:ingest"
+REDIS_CARE_STREAM  = "care:records"           # 6대 의무기록 스트림 (신규)
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv(
     "ALLOWED_ORIGINS", "http://localhost:3000"
 ).split(",") if o.strip()]
@@ -97,7 +115,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "Cache-Control"],
+    allow_headers=["Content-Type", "Authorization", "Cache-Control", "Idempotency-Key"],
 )
 
 # ── 엔젤 브리지 라우터 마운트 (기생형 Bounded Context) ──────────
@@ -414,7 +432,7 @@ async def sse_stream(request: Request):
 
 @app.get("/api/v2/alerts", tags=["대시보드"])
 async def get_alerts(minutes: int = 5):
-    """Alert View: N분 이내 미처리 건 조회"""
+    """Alert View: N분 이내 미처리 건 조회 — v_evidence_sealed 뷰 사용"""
     if engine is None:
         raise HTTPException(503, "DB 미연결")
     try:
@@ -427,7 +445,7 @@ async def get_alerts(minutes: int = 5):
                        o.attempts AS sync_attempts,
                        EXTRACT(EPOCH FROM (NOW() - e.ingested_at)) / 60
                            AS minutes_elapsed
-                FROM evidence_ledger e
+                FROM v_evidence_sealed e
                 LEFT JOIN outbox_events o ON o.ledger_id = e.id
                 WHERE (o.status IS NULL OR o.status IN ('pending', 'processing'))
                   AND e.ingested_at >= NOW() - (:minutes || ' minutes')::INTERVAL
@@ -441,11 +459,21 @@ async def get_alerts(minutes: int = 5):
 
 @app.get("/api/v2/audit", tags=["대시보드"])
 async def get_audit(facility_id: Optional[str] = None, limit: int = 200):
-    """Audit-Ready View: 수급자별 해시/WORM/타임스탬프 원장"""
+    """
+    Audit-Ready View: 수급자별 해시/WORM/타임스탬프 원장.
+    v_evidence_sealed: 봉인된 값 우선 노출 + is_sealed/is_flagged 자동 파생.
+    """
     if engine is None:
         raise HTTPException(503, "DB 미연결")
     try:
-        where = "WHERE e.facility_id = :fid" if facility_id else ""
+        # ── [TD-06 패턴] WHERE 1=1 안전 동적 빌더 ──
+        filters = ["1=1"]
+        params: dict = {"lim": limit}
+        if facility_id:
+            filters.append("e.facility_id = :fid")
+            params["fid"] = facility_id
+        where_sql = "WHERE " + " AND ".join(filters)
+
         with engine.connect() as conn:
             rows = conn.execute(text(f"""
                 SELECT e.id, e.facility_id, e.beneficiary_id,
@@ -453,16 +481,16 @@ async def get_audit(facility_id: Optional[str] = None, limit: int = 200):
                        e.recorded_at, e.ingested_at,
                        e.audio_sha256, e.chain_hash,
                        e.worm_bucket, e.worm_object_key, e.worm_retain_until,
-                       e.transcript_text != '' AS has_audio,
-                       e.chain_hash != 'pending' AS is_sealed,
+                       (e.transcript_text != '') AS has_audio,
+                       e.is_sealed,
                        e.is_flagged,
                        o.status AS outbox_status
-                FROM evidence_ledger e
+                FROM v_evidence_sealed e
                 LEFT JOIN outbox_events o ON o.ledger_id = e.id
-                {where}
+                {where_sql}
                 ORDER BY e.recorded_at DESC
                 LIMIT :lim
-            """), {"fid": facility_id, "lim": limit}).fetchall()
+            """), params).fetchall()
         return {"records": [dict(r._mapping) for r in rows]}
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -496,7 +524,10 @@ async def patch_evidence_resolution(ledger_id: str, body: ResolutionBody):
     """
     미기록 건 처리 사유 기록.
     AlertDrawer → 현장 확인 요청 전송 시 호출.
-    is_flagged = TRUE 로 전환하고 cause / memo 저장.
+
+    [TD-03] evidence_ledger UPDATE 폐지 — Append-Only 원칙 복구.
+    flagging 이력은 evidence_flag_event 테이블에 INSERT.
+    is_flagged 상태는 v_evidence_sealed 뷰에서 EXISTS로 파생.
     """
     if engine is None:
         raise HTTPException(503, "DB 미연결")
@@ -504,15 +535,30 @@ async def patch_evidence_resolution(ledger_id: str, body: ResolutionBody):
         raise HTTPException(422, "cause 는 필수값입니다.")
     try:
         with engine.begin() as conn:
-            result = conn.execute(text("""
-                UPDATE evidence_ledger
-                   SET is_flagged        = TRUE,
-                       resolution_cause  = :cause,
-                       resolution_memo   = :memo
-                 WHERE id = :lid
-            """), {"lid": ledger_id, "cause": body.cause.strip(), "memo": body.memo})
-        if result.rowcount == 0:
-            raise HTTPException(404, f"ledger_id='{ledger_id}' 를 찾을 수 없습니다.")
+            # ledger 존재 검증 (FK 참조 무결성)
+            exists = conn.execute(text(
+                "SELECT 1 FROM evidence_ledger WHERE id = :lid"
+            ), {"lid": ledger_id}).fetchone()
+            if not exists:
+                raise HTTPException(
+                    404, f"ledger_id='{ledger_id}' 를 찾을 수 없습니다."
+                )
+
+            # Append-Only INSERT — 이력은 누적됨, 절대 덮어쓰지 않음
+            conn.execute(text("""
+                INSERT INTO evidence_flag_event (
+                    id, ledger_id, resolution_cause, resolution_memo,
+                    flagged_by, flagged_at
+                ) VALUES (
+                    gen_random_uuid(), :lid, :cause, :memo,
+                    :by, NOW()
+                )
+            """), {
+                "lid":   ledger_id,
+                "cause": body.cause.strip(),
+                "memo":  body.memo.strip() if body.memo else None,
+                "by":    "admin",
+            })
     except HTTPException:
         raise
     except Exception as e:
@@ -687,7 +733,7 @@ async def list_directives(
     """원장 지시 이력 조회"""
     if engine is None:
         raise HTTPException(503, "DB 미연결")
-    where = "WHERE dc.beneficiary_id = :bid" if beneficiary_id else ""
+    where = "WHERE dc.beneficiary_id = :bid" if beneficiary_id else ""  # nosec B608 — hardcoded SQL fragment, user values bound via :bid param
     try:
         with engine.connect() as conn:
             rows = conn.execute(text(f"""
@@ -716,17 +762,24 @@ async def get_plan_vs_actual(facility_id: Optional[str] = None):
 
     care_labels = ["식사 보조", "배변 보조", "체위 변경", "구강 위생", "목욕 보조", "이동 보조"]
 
-    where = "WHERE e.facility_id = :fid" if facility_id else ""
+    # ── [TD-06 패턴] WHERE 1=1 안전 동적 빌더 ──
+    filters = ["1=1"]
+    params: dict = {}
+    if facility_id:
+        filters.append("e.facility_id = :fid")
+        params["fid"] = facility_id
+    where_sql = "WHERE " + " AND ".join(filters)
+
     try:
         with engine.connect() as conn:
             rows = conn.execute(text(f"""
                 SELECT e.beneficiary_id,
                        e.care_type,
-                       e.chain_hash != 'pending' AS is_sealed
-                FROM evidence_ledger e
-                {where}
+                       e.is_sealed
+                FROM v_evidence_sealed e
+                {where_sql}
                 ORDER BY e.beneficiary_id, e.ingested_at DESC
-            """), {"fid": facility_id}).fetchall()
+            """), params).fetchall()
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -755,6 +808,276 @@ async def get_plan_vs_actual(facility_id: Optional[str] = None):
         })
 
     return {"plans": plans}
+
+
+# ══════════════════════════════════════════════════════════════════
+# [6] 6대 의무기록 수집 — POST /api/v8/care-record
+#
+# 데이터 플로우:
+#   수신(JSON) → server_ts 봉인
+#   → [Atomic Tx: care_record_ledger INSERT + care_record_outbox INSERT]
+#   → Redis XADD (care:records 스트림 → 워커 비동기 처리)
+#   → 202 반환
+#
+# 워커가 care_record_outbox를 소비 → call_gemini_care_record()
+# → notion_sync_outbox에 care_record_json 키로 등록
+# → notion_sync 워커가 '일일 케어 기록 DB'에 적재
+#
+# 환경변수:
+#   NOTION_CARE_RECORD_DB_ID — 노션 일일 케어 기록 DB ID (신규 필수)
+# ══════════════════════════════════════════════════════════════════
+
+class CareRecordBody(BaseModel):
+    facility_id:    str
+    beneficiary_id: str
+    caregiver_id:   str
+    raw_voice_text: str              # 현장 발화 원문 텍스트
+    recorded_at:    Optional[str] = None  # ISO-8601, 없으면 server_ts 사용
+
+
+@app.post("/api/v8/care-record", status_code=202, tags=["6대 의무기록"])
+async def ingest_care_record(body: CareRecordBody):
+    """
+    현장 발화 기반 6대 의무기록 수집.
+
+    [불변 원칙]
+      - care_record_ledger + care_record_outbox 단일 트랜잭션 원자 적재
+      - Gemini 처리 및 Notion 적재는 트랜잭션 외부의 워커가 담당
+      - recorded_at 미제공 시 server_ts(UTC) 강제 적용
+    """
+    if engine is None:
+        raise HTTPException(503, "DB 미연결")
+    if not body.raw_voice_text.strip():
+        raise HTTPException(422, "raw_voice_text 는 필수값입니다.")
+
+    server_ts = datetime.now(timezone.utc)
+    record_id = str(uuid4())
+
+    # 클라이언트 제공 recorded_at 사용, 없으면 server_ts
+    recorded_at = body.recorded_at or server_ts.isoformat()
+
+    outbox_payload = json.dumps({
+        "record_id":      record_id,
+        "facility_id":    body.facility_id,
+        "beneficiary_id": body.beneficiary_id,
+        "caregiver_id":   body.caregiver_id,
+        "raw_voice_text": body.raw_voice_text,
+        "recorded_at":    recorded_at,
+        "server_ts":      server_ts.isoformat(),
+    }, ensure_ascii=False)
+
+    try:
+        with engine.begin() as conn:
+            # [A] care_record_ledger: 불변 원장 INSERT (append-only)
+            conn.execute(text("""
+                INSERT INTO care_record_ledger (
+                    id, facility_id, beneficiary_id, caregiver_id,
+                    raw_voice_text, server_ts, recorded_at
+                ) VALUES (
+                    :id, :facility_id, :beneficiary_id, :caregiver_id,
+                    :raw_voice_text, :server_ts, :recorded_at
+                )
+            """), {
+                "id":             record_id,
+                "facility_id":    body.facility_id,
+                "beneficiary_id": body.beneficiary_id,
+                "caregiver_id":   body.caregiver_id,
+                "raw_voice_text": body.raw_voice_text,
+                "server_ts":      server_ts,
+                "recorded_at":    recorded_at,
+            })
+
+            # [B] care_record_outbox: 비동기 처리 큐 INSERT (동일 트랜잭션)
+            conn.execute(text("""
+                INSERT INTO care_record_outbox (
+                    id, record_id, status, attempts, payload, created_at
+                ) VALUES (
+                    :id, :record_id, 'pending', 0,
+                    CAST(:payload AS jsonb), :created_at
+                )
+            """), {
+                "id":        str(uuid4()),
+                "record_id": record_id,
+                "payload":   outbox_payload,
+                "created_at": server_ts,
+            })
+
+        # ← COMMIT 완료. 케어 기록 봉인 완료.
+        logger.info(
+            f"[CARE-RECORD] ✅ COMMIT: record={record_id} "
+            f"facility={body.facility_id} beneficiary={body.beneficiary_id}"
+        )
+
+    except Exception as e:
+        logger.error(f"[CARE-RECORD] DB 트랜잭션 실패: {e}")
+        raise HTTPException(500, f"저장 실패: {e}")
+
+    # ── Redis XADD: care:records 스트림 → 워커 비동기 처리 알림 ──
+    if redis_pub:
+        try:
+            await redis_pub.xadd(
+                REDIS_CARE_STREAM,
+                {"record_id": record_id, "server_ts": server_ts.isoformat()},
+                maxlen=10000,
+            )
+            logger.info("[CARE-RECORD] Redis XADD → care:records 완료.")
+        except Exception as e:
+            logger.warning(f"[CARE-RECORD] Redis XADD 실패 (outbox 폴링 백업): {e}")
+
+    return {
+        "accepted":   True,
+        "record_id":  record_id,
+        "server_ts":  server_ts.isoformat(),
+        "message":    "케어 기록 봉인 완료. Gemini 정제·Notion 적재는 비동기 처리 중.",
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# [Phase 7-v7] 카카오톡 서브박스 라우팅 — 사령관 특별 지시 룰 v1
+#   원칙 #1: emergency = 원장 + 관리자 fan-out
+#   원칙 #2: shiftCode 100% AUTO (서버 단일 진실원)
+#   원칙 #3: TTL 골든타임은 FE 측에서 데드라인 강제 (20s / 60s)
+#   원칙 #4: 템플릿 코드는 환경변수 더미 — 인프라팀 추후 처리
+# ══════════════════════════════════════════════════════════════════
+
+class V7EmergencyBody(BaseModel):
+    transcript:  str
+    severity:    Optional[str] = "critical"
+    occurredAt:  Optional[str] = None
+    deviceId:    Optional[str] = None
+    ledgerRefId: Optional[str] = None
+
+
+class V7ShiftGroupBody(BaseModel):
+    transcript:    str
+    shiftCode:     str = "AUTO"
+    occurredAt:    Optional[str] = None
+    deviceId:      Optional[str] = None
+    handoverState: Optional[str] = "share"
+
+
+async def _v7_dedupe_or_409(idempotency_key: str) -> None:
+    """
+    Redis SETNX 기반 24h 멱등 가드.
+    동일 Idempotency-Key 재호출 시 즉시 409 → 카카오 중복 발송 차단.
+    """
+    if not idempotency_key:
+        raise HTTPException(400, "MISSING_IDEMPOTENCY_KEY")
+    if redis_pub is None:
+        # Redis 미가동 환경(테스트 등) — 가드 우회하되 경고
+        logger.warning("[V7-DEDUPE] Redis 미가동 — 멱등 가드 SKIP")
+        return
+    ok = await redis_pub.set(
+        f"v7:idem:{idempotency_key}",
+        "1",
+        ex=86400,
+        nx=True,
+    )
+    if not ok:
+        raise HTTPException(409, "DUPLICATE_IDEMPOTENCY")
+
+
+@app.post("/api/v7/notify/emergency", status_code=202, tags=["v7 카카오 라우팅"])
+async def v7_notify_emergency(
+    body: V7EmergencyBody,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+):
+    """
+    🚨 긴급 직통 알림톡 — 원장 + 관리자 fan-out (사령관 원칙 #1).
+    care_record_ledger 등 원장 테이블에 UPDATE/DELETE 발생 0건 보장.
+    """
+    if not body.transcript.strip():
+        raise HTTPException(400, "INVALID_TRANSCRIPT")
+
+    await _v7_dedupe_or_409(idempotency_key)
+
+    targets = [p for p in (EMERGENCY_RECIPIENTS or [DEFAULT_FACILITY_PHONE]) if p]
+    if not targets:
+        logger.error("[V7-EMERGENCY] 수신자 명단 비어있음 — 환경변수 EMERGENCY_RECIPIENTS 미설정")
+        raise HTTPException(503, "NOTIFY_NO_TARGETS")
+
+    variables = {
+        "#{발화내용}": body.transcript[:800],
+        "#{발생시각}": body.occurredAt or datetime.now(timezone.utc).isoformat(),
+        "#{심각도}":   body.severity or "critical",
+    }
+
+    sent, failed = fanout_alimtalk(
+        engine=engine,
+        phones=targets,
+        template_code=ALIMTALK_TPL_EMERGENCY,
+        variables=variables,
+        trigger_type="V7-EMERGENCY",
+    )
+
+    if sent == 0:
+        # 전원 실패 → 카카오 게이트웨이 장애로 간주, 503 → FE는 데드라인 내 재시도
+        raise HTTPException(503, "NOTIFY_PROVIDER_DOWN")
+
+    return {
+        "idempotencyKey": idempotency_key,
+        "deliveryId":     str(uuid4()),
+        "channel":        "alimtalk",
+        "templateCode":   ALIMTALK_TPL_EMERGENCY,
+        "targetCount":    sent,
+        "failedCount":    failed,
+        "queuedAt":       datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.post("/api/v7/notify/shift-group", status_code=202, tags=["v7 카카오 라우팅"])
+async def v7_notify_shift_group(
+    body: V7ShiftGroupBody,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+):
+    """
+    👥 교대조 단체 알림톡 — shiftCode 100% AUTO (사령관 원칙 #2).
+    FE가 'AUTO' 외 값을 보내도 서버는 무시하고 시계 기반 산정.
+    """
+    if not body.transcript.strip():
+        raise HTTPException(400, "INVALID_TRANSCRIPT")
+    if body.shiftCode != "AUTO":
+        # 우회 시도 차단 — 거부하되 합법 경로(AUTO 산정)로 강제 진행
+        logger.warning(
+            f"[V7-SHIFT] FE shiftCode 우회 시도 거부: '{body.shiftCode}' → AUTO 강제"
+        )
+
+    await _v7_dedupe_or_409(idempotency_key)
+
+    resolved = resolve_shift_code_auto()
+    targets  = resolve_shift_recipients(resolved)
+    if not targets:
+        logger.error(f"[V7-SHIFT] 교대조 '{resolved}' 수신자 명단 비어있음")
+        raise HTTPException(400, "EMPTY_SHIFT_GROUP")
+
+    variables = {
+        "#{발화내용}": body.transcript[:1200],
+        "#{인계시각}": body.occurredAt or datetime.now(timezone.utc).isoformat(),
+        "#{교대조}":   resolved,
+    }
+
+    sent, failed = fanout_alimtalk(
+        engine=engine,
+        phones=targets,
+        template_code=ALIMTALK_TPL_SHIFT_GROUP,
+        variables=variables,
+        trigger_type="V7-SHIFT",
+    )
+
+    if sent == 0:
+        raise HTTPException(503, "NOTIFY_PROVIDER_DOWN")
+
+    return {
+        "idempotencyKey":       idempotency_key,
+        "deliveryId":           str(uuid4()),
+        "channel":              "alimtalk",
+        "templateCode":         ALIMTALK_TPL_SHIFT_GROUP,
+        "resolvedShiftCode":    resolved,
+        "targetCount":          sent,
+        "failedCount":          failed,
+        "handoverTransitioned": body.handoverState == "complete",
+        "queuedAt":             datetime.now(timezone.utc).isoformat(),
+    }
 
 
 if __name__ == "__main__":
