@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from "react";
 import { useVoiceGuardSSE } from "@/app/hooks/useVoiceGuardSSE";
 import type { PipelineStage, PipelineStatus } from "@/app/hooks/useVoiceGuardSSE";
 import type { 알림카드데이터 } from "@/components/admin/types";
+import { fetchAuditByLedgerId } from "@/lib/api";
 
 /* ═══════════════════════════════════════════════════════════════════
    타입
@@ -61,33 +62,6 @@ function DonutChart({ value, label, color }: { value: number; label: string; col
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   포렌식 증거 생성 (알림 → 법적 증거 변환)
-   ═══════════════════════════════════════════════════════════════════ */
-function alertToForensic(a: 알림카드데이터): ForensicEvidence {
-  // deterministic SHA-256 mock from ID
-  const hashBase = a.id.replace(/[^a-zA-Z0-9]/g, "");
-  const sha = `e3b0c44298fc1c149afbf4c8996fb924${hashBase.padEnd(32, "0").slice(0, 32)}`;
-  const chain = `7d1a54127b32c4a5${hashBase.padEnd(48, "f").slice(0, 48)}`;
-  const fp = `DV-${a.facility_id.slice(0, 6)}-${a.id.slice(-4)}-AOS12`;
-
-  return {
-    recorded_at: a.ingested_at,
-    beneficiary_id: a.beneficiary_id,
-    recorder_id: a.shift_id,
-    device_fingerprint: fp,
-    audio_sha256: sha,
-    worm_status: a.minutes_elapsed <= 5 ? "PENDING" : "LEGAL_HOLD",
-    worm_retain_until: "2031-12-31T23:59:59Z",
-    gps_coord: a.gps_lat ? `${a.gps_lat.toFixed(5)},${a.gps_lon?.toFixed(5)}` : "미수신",
-    chain_hash: chain,
-    facility_id: a.facility_id,
-    care_type: a.care_type ?? "미지정",
-    minutes_elapsed: a.minutes_elapsed,
-    estimated_clawback: a.예상환수액,
-  };
-}
-
-/* ═══════════════════════════════════════════════════════════════════
    더미 포렌식 데이터 (SSE 미연결 기본 표시용)
    ═══════════════════════════════════════════════════════════════════ */
 const DEMO_FORENSICS: ForensicEvidence[] = [
@@ -96,7 +70,7 @@ const DEMO_FORENSICS: ForensicEvidence[] = [
     beneficiary_id: "B-1002",
     recorder_id: "CW-김미영",
     device_fingerprint: "DV-FAC-SU-001A-AOS12",
-    audio_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    audio_sha256: "PENDING — WORM 봉인 처리 중",
     worm_status: "PENDING",
     worm_retain_until: "2031-12-31T23:59:59Z",
     gps_coord: "37.56650,126.97800",
@@ -146,6 +120,8 @@ export default function DashboardPage() {
   const [currentTime, setCurrentTime] = useState("");
   const [planData, setPlanData] = useState<PlanData | null>(null);
   const [selectedAlert, setSelectedAlert] = useState<알림카드데이터 | null>(null);
+  const [forensicData, setForensicData]       = useState<ForensicEvidence | null>(null);
+  const [forensicLoading, setForensicLoading] = useState(false);
   const [reasonCategory, setReasonCategory] = useState("");
   const [sendingDirective, setSendingDirective] = useState(false);
   const [directiveResult, setDirectiveResult] = useState<"idle" | "success" | "fail">("idle");
@@ -179,6 +155,34 @@ export default function DashboardPage() {
   }, [directiveResult]);
 
   /* ────────────────────────────────────────────────────────────────
+     포렌식 패널: 알림 클릭 시 백엔드에서 실제 WORM 해시 비동기 조회
+     ──────────────────────────────────────────────────────────────── */
+  async function loadForensicEvidence(a: 알림카드데이터): Promise<void> {
+    setForensicLoading(true);
+    setForensicData(null);
+
+    const auditRecord = await fetchAuditByLedgerId(a.id);
+    const fp = `DV-${a.facility_id.slice(0, 6)}-${a.id.slice(-4)}-AOS12`;
+
+    setForensicData({
+      recorded_at:        a.ingested_at,
+      beneficiary_id:     a.beneficiary_id,
+      recorder_id:        a.shift_id,
+      device_fingerprint: fp,
+      audio_sha256:       auditRecord?.audio_sha256   ?? "PENDING — WORM 봉인 처리 중",
+      chain_hash:         auditRecord?.chain_hash     ?? "PENDING — WORM 봉인 처리 중",
+      worm_status:        auditRecord?.is_sealed      ? "LEGAL_HOLD" : "PENDING",
+      worm_retain_until:  auditRecord?.worm_retain_until ?? "—",
+      gps_coord:          a.gps_lat != null ? `${a.gps_lat}, ${a.gps_lon}` : "미수집",
+      facility_id:        a.facility_id,
+      care_type:          a.care_type ?? "미분류",
+      minutes_elapsed:    a.minutes_elapsed,
+      estimated_clawback: a.예상환수액,
+    });
+    setForensicLoading(false);
+  }
+
+  /* ────────────────────────────────────────────────────────────────
      4단계: 방어 증거 패키지 다운로드 → audit_export_job 트리거
      ──────────────────────────────────────────────────────────────── */
   const handleDownloadEvidence = useCallback(async () => {
@@ -199,10 +203,8 @@ export default function DashboardPage() {
         return;
       }
     } catch {}
-    // 폴백: JSON
-    const records = sseAlerts.length > 0
-      ? sseAlerts.map(alertToForensic)
-      : DEMO_FORENSICS;
+    // 폴백: JSON (데모 데이터)
+    const records = DEMO_FORENSICS;
     const blob = new Blob([JSON.stringify({
       exported_at: new Date().toISOString(),
       export_type: "defense_evidence_package",
@@ -269,14 +271,8 @@ export default function DashboardPage() {
     (s, r) => s + Object.values(r.items).filter((v) => v === "미기록").length, 0
   ) ?? 8;
 
-  // 포렌식 데이터 — 선택된 알림 또는 전체 리스트
-  const forensicList: ForensicEvidence[] = sseAlerts.length > 0
-    ? sseAlerts.map(alertToForensic)
-    : DEMO_FORENSICS;
-
-  const selectedForensic: ForensicEvidence | null = selectedAlert
-    ? alertToForensic(selectedAlert)
-    : null;
+  // 포렌식 요약 테이블용 — 데모 데이터 (미선택 시 표시)
+  const forensicList: ForensicEvidence[] = DEMO_FORENSICS;
 
   return (
     <div className="min-h-screen bg-[#0a0e1a] text-slate-100 font-sans flex flex-col">
@@ -356,32 +352,16 @@ export default function DashboardPage() {
               <>
                 <KanbanCard name="김영수" beneficiary="B-1002" type="투약 누락"
                   minutes={3} amount={180_000} isCritical selected={selectedAlert?.id === "demo-001"}
-                  onSelect={() => setSelectedAlert({
-                    id: "demo-001", beneficiary_id: "B-1002", facility_id: "FAC-서울요양원",
-                    shift_id: "CW-김미영", care_type: "투약 보조", ingested_at: "2026-04-07T09:12:33.000Z",
-                    minutes_elapsed: 3, 예상환수액: 180_000, gps_lat: 37.5665, gps_lon: 126.978,
-                  })} />
+                  onSelect={() => { const a = { id: "demo-001", beneficiary_id: "B-1002", facility_id: "FAC-서울요양원", shift_id: "CW-김미영", care_type: "투약 보조", ingested_at: "2026-04-07T09:12:33.000Z", minutes_elapsed: 3, 예상환수액: 180_000, gps_lat: 37.5665, gps_lon: 126.978 }; setSelectedAlert(a); loadForensicEvidence(a); }} />
                 <KanbanCard name="이순자" beneficiary="B-1015" type="체위변경 미기록"
                   minutes={8} amount={95_000} selected={selectedAlert?.id === "demo-002"}
-                  onSelect={() => setSelectedAlert({
-                    id: "demo-002", beneficiary_id: "B-1015", facility_id: "FAC-강남센터",
-                    shift_id: "CW-박정훈", care_type: "체위변경", ingested_at: "2026-04-07T08:45:12.000Z",
-                    minutes_elapsed: 8, 예상환수액: 95_000, gps_lat: 37.4982, gps_lon: 127.0278,
-                  })} />
+                  onSelect={() => { const a = { id: "demo-002", beneficiary_id: "B-1015", facility_id: "FAC-강남센터", shift_id: "CW-박정훈", care_type: "체위변경", ingested_at: "2026-04-07T08:45:12.000Z", minutes_elapsed: 8, 예상환수액: 95_000, gps_lat: 37.4982, gps_lon: 127.0278 }; setSelectedAlert(a); loadForensicEvidence(a); }} />
                 <KanbanCard name="박수진" beneficiary="B-1008" type="배설 보조 미기록"
                   minutes={12} amount={75_000} selected={selectedAlert?.id === "demo-003"}
-                  onSelect={() => setSelectedAlert({
-                    id: "demo-003", beneficiary_id: "B-1008", facility_id: "FAC-서울요양원",
-                    shift_id: "CW-이수진", care_type: "배설 보조", ingested_at: "2026-04-07T08:22:05.000Z",
-                    minutes_elapsed: 12, 예상환수액: 75_000, gps_lat: 37.567, gps_lon: 126.9785,
-                  })} />
+                  onSelect={() => { const a = { id: "demo-003", beneficiary_id: "B-1008", facility_id: "FAC-서울요양원", shift_id: "CW-이수진", care_type: "배설 보조", ingested_at: "2026-04-07T08:22:05.000Z", minutes_elapsed: 12, 예상환수액: 75_000, gps_lat: 37.567, gps_lon: 126.9785 }; setSelectedAlert(a); loadForensicEvidence(a); }} />
                 <KanbanCard name="최동석" beneficiary="B-1023" type="식사 보조 지연"
                   minutes={22} amount={30_000} selected={selectedAlert?.id === "demo-004"}
-                  onSelect={() => setSelectedAlert({
-                    id: "demo-004", beneficiary_id: "B-1023", facility_id: "FAC-강남센터",
-                    shift_id: "CW-한지은", care_type: "식사 보조", ingested_at: "2026-04-07T07:55:00.000Z",
-                    minutes_elapsed: 22, 예상환수액: 30_000,
-                  })} />
+                  onSelect={() => { const a = { id: "demo-004", beneficiary_id: "B-1023", facility_id: "FAC-강남센터", shift_id: "CW-한지은", care_type: "식사 보조", ingested_at: "2026-04-07T07:55:00.000Z", minutes_elapsed: 22, 예상환수액: 30_000 } as 알림카드데이터; setSelectedAlert(a); loadForensicEvidence(a); }} />
               </>
             ) : (
               <>
@@ -390,7 +370,7 @@ export default function DashboardPage() {
                     dotColor="bg-red-500" textColor="text-red-400" borderColor="border-red-800/60" pulse>
                     {criticalAlerts.map((a) => (
                       <SSEAlertCard key={a.id} alert={a} selected={selectedAlert?.id === a.id}
-                        onSelect={() => setSelectedAlert(a)} />
+                        onSelect={() => { setSelectedAlert(a); loadForensicEvidence(a); }} />
                     ))}
                   </AlertGroup>
                 )}
@@ -399,7 +379,7 @@ export default function DashboardPage() {
                     dotColor="bg-amber-500" textColor="text-amber-400" borderColor="border-amber-800/60">
                     {warningAlerts.map((a) => (
                       <SSEAlertCard key={a.id} alert={a} selected={selectedAlert?.id === a.id}
-                        onSelect={() => setSelectedAlert(a)} />
+                        onSelect={() => { setSelectedAlert(a); loadForensicEvidence(a); }} />
                     ))}
                   </AlertGroup>
                 )}
@@ -408,7 +388,7 @@ export default function DashboardPage() {
                     dotColor="bg-orange-500" textColor="text-orange-400" borderColor="border-orange-800/60">
                     {overdueAlerts.map((a) => (
                       <SSEAlertCard key={a.id} alert={a} selected={selectedAlert?.id === a.id}
-                        onSelect={() => setSelectedAlert(a)} />
+                        onSelect={() => { setSelectedAlert(a); loadForensicEvidence(a); }} />
                     ))}
                   </AlertGroup>
                 )}
@@ -490,10 +470,15 @@ export default function DashboardPage() {
 
           {/* ── 포렌식 증거 테이블 (항상 표시) ── */}
           <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
-            {selectedForensic ? (
-              /* 선택된 카드의 상세 포렌식 증거 */
-              <ForensicDetailView f={selectedForensic} />
-            ) : (
+            {forensicLoading && (
+              <div className="text-slate-400 text-xs animate-pulse">
+                WORM 해시 조회 중...
+              </div>
+            )}
+            {forensicData && !forensicLoading ? (
+              /* 선택된 카드의 상세 포렌식 증거 (실 WORM 해시 비동기 로드) */
+              <ForensicDetailView f={forensicData} />
+            ) : !forensicLoading && (
               /* 미선택 시: 전체 포렌식 요약 테이블 */
               <div className="space-y-2">
                 <div className="text-[10px] uppercase tracking-widest text-slate-500 font-bold px-1">

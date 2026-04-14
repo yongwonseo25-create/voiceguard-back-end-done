@@ -13,6 +13,9 @@ import hmac
 import logging
 import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+_KST = ZoneInfo("Asia/Seoul")
 from typing import Optional
 
 import requests
@@ -57,11 +60,15 @@ ALIMTALK_OVERDUE_MINUTES = int(os.getenv("ALIMTALK_OVERDUE_MINUTES", "3"))
 def resolve_shift_code_auto(now: Optional[datetime] = None) -> str:
     """
     사령관 원칙 #2: shiftCode는 100% AUTO. 서버 시계 단일 진실원.
-        DAY     06:00 ≤ h < 14:00
-        EVENING 14:00 ≤ h < 22:00
-        NIGHT   22:00 ≤ h < 06:00
+    타임존: KST(Asia/Seoul) 고정 — 서버 OS 로컬 설정에 무관.
+        DAY     06:00 ≤ h < 14:00  (KST)
+        EVENING 14:00 ≤ h < 22:00  (KST)
+        NIGHT   22:00 ≤ h < 06:00  (KST)
     """
-    h = (now or datetime.now()).hour
+    # UTC 기준 현재 시각을 KST로 변환 — datetime.now() 로컬 타임존 의존 제거
+    utc_now = now if now else datetime.now(timezone.utc)
+    kst_now = utc_now.astimezone(_KST)
+    h = kst_now.hour
     if 6 <= h < 14:
         return "DAY"
     if 14 <= h < 22:
@@ -172,16 +179,39 @@ def _call_solapi(phone: str, template_code: str, variables: dict) -> None:
 
 
 def _is_already_sent(conn, ledger_id: Optional[str], trigger_type: str) -> bool:
-    """중복 발송 방지: 동일 ledger_id + trigger_type 조합이 이미 'sent' 이력 있으면 True"""
+    """중복 발송 방지.
+    ledger_id가 UUID(36자, 하이픈 4개) → ::uuid 캐스트 사용.
+    ledger_id가 합성 키(fan-out용) → TEXT 비교.
+    ledger_id가 None → 체크 스킵 (기존 동작 유지).
+    """
     if not ledger_id:
         return False
-    row = conn.execute(text("""
-        SELECT 1 FROM notification_log
-        WHERE ledger_id = :lid::uuid
-          AND trigger_type = :tt
-          AND status = 'sent'
-        LIMIT 1
-    """), {"lid": ledger_id, "tt": trigger_type}).fetchone()
+
+    # UUID 여부 판별 — fan-out 합성 키는 UUID 형식이 아님
+    is_uuid = (
+        len(ledger_id) == 36
+        and ledger_id.count("-") == 4
+        and all(c in "0123456789abcdefABCDEF-" for c in ledger_id)
+    )
+
+    if is_uuid:
+        sql = """
+            SELECT 1 FROM notification_log
+            WHERE ledger_id = :lid::uuid
+              AND trigger_type = :tt
+              AND status = 'sent'
+            LIMIT 1
+        """
+    else:
+        sql = """
+            SELECT 1 FROM notification_log
+            WHERE ledger_id::text = :lid
+              AND trigger_type = :tt
+              AND status = 'sent'
+            LIMIT 1
+        """
+
+    row = conn.execute(text(sql), {"lid": ledger_id, "tt": trigger_type}).fetchone()
     return row is not None
 
 
@@ -304,6 +334,7 @@ def fanout_alimtalk(
     template_code: str,
     variables: dict,
     trigger_type: str,
+    idempotency_key: Optional[str] = None,   # ← 신규 파라미터 추가
 ):
     """
     여러 수신자에게 동일 알림톡을 fan-out 발송.
@@ -312,13 +343,17 @@ def fanout_alimtalk(
     sent = 0
     failed = 0
     for phone in phones:
+        # idempotency_key + phone 합성 → phone별 고유 dedup 키 생성
+        # Redis 장애 시에도 notification_log DB 레벨에서 중복 차단 보장
+        dedup_key = f"{idempotency_key}:{phone.replace('-', '')}" if idempotency_key else None
+
         ok = send_alimtalk(
             engine=engine,
             phone=phone,
             template_code=template_code,
             variables=variables,
             trigger_type=trigger_type,
-            ledger_id=None,
+            ledger_id=dedup_key,         # None 대신 합성 키 전달
         )
         if ok:
             sent += 1

@@ -161,3 +161,20 @@ export async function fetchDirectives(
   );
   return data.directives;
 }
+
+/**
+ * GET /api/v2/audit — 단건 WORM 해시 조회
+ * ledger_id로 해당 원장 레코드의 실제 audio_sha256, chain_hash 조회.
+ * 존재하지 않거나 아직 봉인 미완료이면 null 반환.
+ */
+export async function fetchAuditByLedgerId(
+  ledgerId: string
+): Promise<AuditRecord | null> {
+  try {
+    // 백엔드 /api/v2/audit은 전체 목록 반환 — facility_id 없이 호출 후 클라이언트 필터
+    const data = await apiFetch<{ records: AuditRecord[] }>("/api/v2/audit");
+    return data.records.find((r) => r.id === ledgerId) ?? null;
+  } catch {
+    return null;
+  }
+}

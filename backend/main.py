@@ -385,6 +385,7 @@ async def sse_stream(request: Request):
         })
 
         try:
+            idle_ticks = 0                           # keep-alive 간격 카운터
             while True:
                 # 클라이언트 연결 끊김 감지
                 if await request.is_disconnected():
@@ -397,6 +398,7 @@ async def sse_stream(request: Request):
                 )
 
                 if message and message.get("type") == "message":
+                    idle_ticks = 0                   # 메시지 수신 시 카운터 리셋
                     try:
                         payload = json.loads(message["data"])
                         event   = payload.get("event", "update")
@@ -405,9 +407,11 @@ async def sse_stream(request: Request):
                     except (json.JSONDecodeError, KeyError) as e:
                         logger.warning(f"[SSE] 메시지 파싱 실패: {e}")
                 else:
-                    # 30초마다 keep-alive (프락시 타임아웃 방지)
-                    yield ": keep-alive\n\n"
-                    await asyncio.sleep(0)
+                    idle_ticks += 1
+                    if idle_ticks >= 30:             # 30 × 1초 = 30초 간격
+                        yield ": keep-alive\n\n"
+                        idle_ticks = 0
+                    # asyncio.sleep 불필요 — get_message(timeout=1.0)이 이미 대기 수행
 
         except asyncio.CancelledError:
             logger.info(f"[SSE] 스트림 취소: {request.client}")
@@ -1008,6 +1012,7 @@ async def v7_notify_emergency(
         template_code=ALIMTALK_TPL_EMERGENCY,
         variables=variables,
         trigger_type="V7-EMERGENCY",
+        idempotency_key=idempotency_key,     # ← 추가: Header에서 수신한 값
     )
 
     if sent == 0:
@@ -1062,6 +1067,7 @@ async def v7_notify_shift_group(
         template_code=ALIMTALK_TPL_SHIFT_GROUP,
         variables=variables,
         trigger_type="V7-SHIFT",
+        idempotency_key=idempotency_key,     # ← 추가
     )
 
     if sent == 0:

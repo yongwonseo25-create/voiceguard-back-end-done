@@ -1,20 +1,43 @@
 import { NextResponse } from "next/server";
 
-export async function GET() {
-  return NextResponse.json({
-    matchRate: 96.8,
-    estimatedRiskAmount: 1_429_823,
-    tiers: {
-      admin:    96.8,
-      evidence: 99.2,
-      claim:    94.1,
-    },
-    recipients: [
-      { name: "김철수", items: { "식사": "완료", "체위변경": "미기록", "투약": "완료", "배설": "완료", "개인위생": "완료", "활동": "미기록" } },
-      { name: "이영희", items: { "식사": "완료", "체위변경": "완료", "투약": "미기록", "배설": "완료", "개인위생": "미기록", "활동": "완료" } },
-      { name: "박지민", items: { "식사": "미기록", "체위변경": "완료", "투약": "완료", "배설": "미기록", "개인위생": "완료", "활동": "완료" } },
-      { name: "정수연", items: { "식사": "완료", "체위변경": "완료", "투약": "완료", "배설": "완료", "개인위생": "미기록", "활동": "미기록" } },
-      { name: "김영수", items: { "식사": "완료", "체위변경": "완료", "투약": "미기록", "배설": "완료", "개인위생": "완료", "활동": "완료" } },
-    ],
-  });
+/**
+ * GET /api/plan-actual
+ * BFF 프록시: 백엔드 /api/v2/plan 을 서버 사이드에서 호출하여 반환.
+ *
+ * 설계 원칙:
+ *   - cache: "no-store" — 법적 의무기록은 캐시 절대 금지
+ *   - 백엔드 장애 시 503 반환 — 더미 데이터 노출 완전 차단
+ *   - facility_id 쿼리 파라미터 투명 전달
+ */
+
+const BACKEND_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const facilityId = searchParams.get("facility_id");
+  const qs = facilityId ? `?facility_id=${encodeURIComponent(facilityId)}` : "";
+
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/v2/plan${qs}`, {
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => res.statusText);
+      return NextResponse.json(
+        { error: `Backend error ${res.status}`, detail: text },
+        { status: res.status }
+      );
+    }
+
+    const data = await res.json();
+    return NextResponse.json(data);
+
+  } catch (err) {
+    return NextResponse.json(
+      { error: "Backend unreachable", detail: String(err) },
+      { status: 503 }
+    );
+  }
 }
