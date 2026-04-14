@@ -20,8 +20,13 @@ from pathlib import Path
 from typing import AsyncGenerator, Optional
 from uuid import uuid4
 
-import redis.asyncio as aioredis
+# ── load_dotenv 최우선 실행: 로컬 모듈 임포트 전에 환경변수 주입 ──
+# Cloud Run에서는 Secret Manager가 환경변수를 직접 주입하므로 no-op.
+# 로컬에서는 backend/.env를 읽어 os.environ에 적재.
 from dotenv import load_dotenv
+load_dotenv()
+
+import redis.asyncio as aioredis
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,13 +45,12 @@ from notifier import (
     resolve_shift_code_auto,
     resolve_shift_recipients,
     fanout_alimtalk,
+    _KST,  # KST ZoneInfo — v8 handover 교대조 계산용
 )
 from angel_bridge import router as angel_router, init_angel_bridge
 from angel_export import router as angel_export_router, init_angel_export
 from angel_rpa import router as angel_rpa_router, init_angel_rpa
 from env_guard import check_env_vars
-
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1084,6 +1088,400 @@ async def v7_notify_shift_group(
         "handoverTransitioned": body.handoverState == "complete",
         "queuedAt":             datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+# [v8 Director/Admin Dashboard] Directer_Dashboard 용접 레이어
+#
+# 불변 원칙 준수:
+#   - evidence_ledger / care_record_ledger / care_plan_ledger 스키마 수정 0
+#   - Instruct → evidence_flag_event INSERT (Append-Only)
+#   - Approve/Resolve/Ack → outbox 큐 상태 전환만 (ledger 불변)
+#   - 카카오·노션 외부 API: BypassStub (로그만 기록, 실 호출 없음)
+# ══════════════════════════════════════════════════════════════════
+
+def _fmt_elapsed(minutes: float) -> str:
+    """경과 분수 → 한국어 시간 문자열"""
+    if minutes < 1:
+        return "방금 전"
+    if minutes < 60:
+        return f"{int(minutes)}분 전"
+    if minutes < 1440:
+        h = int(minutes // 60)
+        m = int(minutes % 60)
+        return f"{h}시간 {m}분 전" if m else f"{h}시간 전"
+    d = int(minutes // 1440)
+    return f"{d}일 전"
+
+
+# ── 1. GET /api/v8/director/kpi ────────────────────────────────────
+
+@app.get("/api/v8/director/kpi", tags=["v8 대시보드"])
+def v8_director_kpi():
+    """원장장 대시보드 4대 핵심 KPI — DB 실시간 집계"""
+    if engine is None:
+        raise HTTPException(503, "DB 미연결")
+    with engine.connect() as conn:
+        # 1) 미조치 고위험 건수: 증거 플래그 이력이 있는 원장 건수
+        red_flags = conn.execute(text(
+            "SELECT COUNT(*) FROM v_evidence_sealed WHERE is_flagged = TRUE"
+        )).scalar() or 0
+
+        # 2) 오늘 케어기록 완결률
+        today_row = conn.execute(text("""
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'done') AS done_count,
+                COUNT(*)                                 AS total_count
+            FROM care_record_outbox
+            WHERE created_at >= CURRENT_DATE
+        """)).mappings().one()
+        total = today_row["total_count"] or 0
+        done  = today_row["done_count"]  or 0
+        completion_rate = round(done * 100.0 / total) if total > 0 else 100
+
+        # 3) SLA 24h 초과 미처리: outbox_events + care_record_outbox 합산
+        sla_exceeded = conn.execute(text("""
+            SELECT COUNT(*) FROM (
+                SELECT id FROM care_record_outbox
+                 WHERE status IN ('pending', 'processing')
+                   AND created_at < NOW() - INTERVAL '24 hours'
+                UNION ALL
+                SELECT o.id FROM outbox_events o
+                 WHERE o.status NOT IN ('done', 'sent')
+                   AND o.created_at < NOW() - INTERVAL '24 hours'
+            ) t
+        """)).scalar() or 0
+
+        # 4) 인수인계 누락: DLQ 처리 실패 건수
+        missing_ack = conn.execute(text(
+            "SELECT COUNT(*) FROM care_record_outbox WHERE status = 'dlq'"
+        )).scalar() or 0
+
+    return {
+        "redFlags":       int(red_flags),
+        "completionRate": int(completion_rate),
+        "slaExceeded":    int(sla_exceeded),
+        "missingAck":     int(missing_ack),
+    }
+
+
+# ── 2. GET /api/v8/director/decision-queue ────────────────────────
+
+@app.get("/api/v8/director/decision-queue", tags=["v8 대시보드"])
+def v8_director_decision_queue():
+    """우선 조치 리스트: 플래그된 증거 원장 + DLQ 지연 통합"""
+    if engine is None:
+        raise HTTPException(503, "DB 미연결")
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT
+                e.id::text                                                  AS id,
+                e.facility_id                                               AS facility_name,
+                COALESCE(NULLIF(e.shift_id, ''), '담당자 미지정')          AS admin_name,
+                CASE WHEN e.is_flagged THEN '케어 누락 위험'
+                     ELSE '증거 봉인 지연'
+                END                                                         AS problem_type,
+                GREATEST(
+                    EXTRACT(EPOCH FROM (NOW() - e.ingested_at)) / 60.0, 0
+                )                                                           AS minutes_elapsed,
+                CASE WHEN e.is_sealed                THEN 'ready'
+                     WHEN COALESCE(e.audio_sha256,'') != '' THEN 'partial'
+                     ELSE 'missing'
+                END                                                         AS evidence_status,
+                e.is_flagged                                                AS flagged
+            FROM v_evidence_sealed e
+            WHERE e.is_flagged = TRUE
+               OR EXISTS (
+                   SELECT 1 FROM outbox_events o
+                    WHERE o.ledger_id = e.id AND o.status = 'dlq'
+               )
+            ORDER BY e.ingested_at ASC
+            LIMIT 100
+        """)).mappings().all()
+
+        # 시설별 영향 수급자 수 일괄 조회
+        facility_ids = list({r["facility_name"] for r in rows})
+        affected_map: dict = {}
+        if facility_ids:
+            placeholders = ", ".join(f":f{i}" for i in range(len(facility_ids)))
+            params = {f"f{i}": fid for i, fid in enumerate(facility_ids)}
+            aff_rows = conn.execute(text(f"""
+                SELECT facility_id, COUNT(DISTINCT beneficiary_id) AS cnt
+                FROM evidence_ledger
+                WHERE facility_id IN ({placeholders})
+                GROUP BY facility_id
+            """), params).mappings().all()
+            affected_map = {r["facility_id"]: int(r["cnt"]) for r in aff_rows}
+
+    result = []
+    for r in rows:
+        mins     = float(r["minutes_elapsed"] or 0)
+        flagged  = bool(r["flagged"])
+        affected = max(1, affected_map.get(r["facility_name"], 1))
+        days     = max(1, int(mins // 1440))
+
+        # 위험 등급: 플래그 + 24h 초과 → severe, 플래그 → high, 그 외 → medium
+        if flagged and mins > 1440:
+            risk = "severe"
+        elif flagged:
+            risk = "high"
+        else:
+            risk = "medium"
+
+        # 예상 환수액 추정: 수급자 × 15만원 × 경과일 (실제 청구 단가 대용)
+        clawback = affected * 150_000 * days
+
+        result.append({
+            "id":                 r["id"],
+            "facilityName":       r["facility_name"],
+            "adminName":          r["admin_name"],
+            "problemType":        r["problem_type"],
+            "elapsedTime":        _fmt_elapsed(mins),
+            "expectedClawback":   clawback,
+            "affectedRecipients": affected,
+            "evidenceStatus":     r["evidence_status"],
+            "riskLevel":          risk,
+        })
+    return result
+
+
+# ── 3. POST /api/v8/director/decision/{id}/instruct ───────────────
+
+class V8InstructBody(BaseModel):
+    actionType: str
+
+
+@app.post(
+    "/api/v8/director/decision/{ledger_id}/instruct",
+    status_code=202,
+    tags=["v8 대시보드"],
+)
+def v8_director_instruct(ledger_id: str, body: V8InstructBody):
+    """
+    원장장 긴급 지시 — evidence_flag_event INSERT (Append-Only 원칙 준수).
+    카카오 알림톡 BypassStub: 실 API 호출 없이 로그만 기록.
+    """
+    if engine is None:
+        raise HTTPException(503, "DB 미연결")
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO evidence_flag_event (
+                id, ledger_id, resolution_cause, resolution_memo,
+                flagged_by, flagged_at
+            ) VALUES (
+                gen_random_uuid(), :lid::uuid,
+                :cause, :memo, 'director', NOW()
+            )
+        """), {
+            "lid":   ledger_id,
+            "cause": body.actionType,
+            "memo":  f"원장장 긴급 지시: {body.actionType}",
+        })
+    # ── 카카오 알림톡 BypassStub (작전 지침: 외부 API 보류) ──────
+    logger.info(
+        f"[BYPASS-KAKAO] director instruct ledger={ledger_id} action={body.actionType}"
+    )
+    return {"accepted": True, "ledger_id": ledger_id, "action": body.actionType}
+
+
+# ── 4. GET /api/v8/admin/pending-reviews ─────────────────────────
+
+@app.get("/api/v8/admin/pending-reviews", tags=["v8 대시보드"])
+def v8_admin_pending_reviews():
+    """기존 시스템 전송 전 1차 검수 목록 — care_record_outbox pending"""
+    if engine is None:
+        raise HTTPException(503, "DB 미연결")
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT
+                o.id::text                                          AS id,
+                c.facility_id || ' — ' || c.beneficiary_id         AS title,
+                LEFT(c.raw_voice_text, 300)                         AS details
+            FROM care_record_outbox o
+            JOIN care_record_ledger c ON c.id = o.record_id
+            WHERE o.status = 'pending'
+            ORDER BY o.created_at ASC
+            LIMIT 50
+        """)).mappings().all()
+    return [{"id": r["id"], "title": r["title"], "details": r["details"]} for r in rows]
+
+
+# ── 5. POST /api/v8/admin/pending-reviews/approve-all ─────────────
+
+@app.post(
+    "/api/v8/admin/pending-reviews/approve-all",
+    status_code=202,
+    tags=["v8 대시보드"],
+)
+def v8_admin_approve_all():
+    """
+    전체 검수 승인 — care_record_outbox pending→done 상태 전환.
+    원장(ledger) 불변 원칙 준수: outbox 큐 상태만 전환.
+    노션 연동 BypassStub: 실 API 호출 없이 로그만 기록.
+    """
+    if engine is None:
+        raise HTTPException(503, "DB 미연결")
+    with engine.begin() as conn:
+        result = conn.execute(text("""
+            UPDATE care_record_outbox
+               SET status = 'done', processed_at = NOW()
+             WHERE status = 'pending'
+        """))
+        updated = result.rowcount
+    # ── 노션 연동 BypassStub ──────────────────────────────────────
+    logger.info(f"[BYPASS-NOTION] approve-all updated={updated} rows")
+    return {"accepted": True, "approvedCount": updated}
+
+
+# ── 6. GET /api/v8/admin/action-queue ────────────────────────────
+
+@app.get("/api/v8/admin/action-queue", tags=["v8 대시보드"])
+def v8_admin_action_queue():
+    """통합 긴급 지시 대기열 — DLQ 항목 (evidence + care_record 통합)"""
+    if engine is None:
+        raise HTTPException(503, "DB 미연결")
+    with engine.connect() as conn:
+        evid_rows = conn.execute(text("""
+            SELECT
+                o.id::text AS id,
+                e.facility_id || ' [증거파일 처리 실패] '
+                    || COALESCE(e.case_type, '')                  AS issue,
+                CASE WHEN o.attempts >= 5 THEN 'high'
+                     WHEN o.attempts >= 3 THEN 'medium'
+                     ELSE 'low'
+                END                                              AS urgency
+            FROM outbox_events o
+            JOIN v_evidence_sealed e ON e.id = o.ledger_id
+            WHERE o.status = 'dlq'
+            ORDER BY o.created_at ASC
+            LIMIT 25
+        """)).mappings().all()
+
+        care_rows = conn.execute(text("""
+            SELECT
+                o.id::text AS id,
+                c.facility_id || ' [케어기록 처리 실패] '
+                    || LEFT(c.raw_voice_text, 40)                 AS issue,
+                CASE WHEN o.attempts >= 5 THEN 'high'
+                     WHEN o.attempts >= 3 THEN 'medium'
+                     ELSE 'low'
+                END                                              AS urgency
+            FROM care_record_outbox o
+            JOIN care_record_ledger c ON c.id = o.record_id
+            WHERE o.status = 'dlq'
+            ORDER BY o.created_at ASC
+            LIMIT 25
+        """)).mappings().all()
+
+    return [
+        {"id": r["id"], "issue": r["issue"], "urgency": r["urgency"]}
+        for r in list(evid_rows) + list(care_rows)
+    ]
+
+
+# ── 7. POST /api/v8/admin/action-queue/{id}/resolve ───────────────
+
+@app.post(
+    "/api/v8/admin/action-queue/{item_id}/resolve",
+    status_code=202,
+    tags=["v8 대시보드"],
+)
+def v8_admin_resolve_action(item_id: str):
+    """
+    긴급 지시 해결 완료 — DLQ→done 상태 전환.
+    care_record_outbox / outbox_events 양쪽 시도 (어느 쪽 ID인지 무관).
+    """
+    if engine is None:
+        raise HTTPException(503, "DB 미연결")
+    with engine.begin() as conn:
+        r1 = conn.execute(text("""
+            UPDATE care_record_outbox
+               SET status = 'done', processed_at = NOW()
+             WHERE id = :id::uuid AND status = 'dlq'
+        """), {"id": item_id})
+        r2 = conn.execute(text("""
+            UPDATE outbox_events
+               SET status = 'done', processed_at = NOW()
+             WHERE id = :id::uuid AND status = 'dlq'
+        """), {"id": item_id})
+        if (r1.rowcount + r2.rowcount) == 0:
+            raise HTTPException(404, "해당 ID의 DLQ 항목이 없습니다.")
+    return {"accepted": True, "id": item_id}
+
+
+# ── 8. GET /api/v8/admin/handovers ───────────────────────────────
+
+@app.get("/api/v8/admin/handovers", tags=["v8 대시보드"])
+def v8_admin_handovers():
+    """이전 교대조 브리핑 확인 목록 — pending 케어기록을 교대조별로 제공"""
+    if engine is None:
+        raise HTTPException(503, "DB 미연결")
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT
+                o.id::text              AS id,
+                c.facility_id           AS facility_id,
+                c.recorded_at           AS recorded_at,
+                LEFT(c.raw_voice_text, 400) AS briefing
+            FROM care_record_outbox o
+            JOIN care_record_ledger c ON c.id = o.record_id
+            WHERE o.status = 'pending'
+            ORDER BY o.created_at DESC
+            LIMIT 30
+        """)).mappings().all()
+
+    result = []
+    for r in rows:
+        # KST 교대조 계산 (notifier._KST 재활용)
+        recorded_at = r["recorded_at"]
+        if recorded_at:
+            try:
+                kst_dt = recorded_at.astimezone(_KST)
+                h = kst_dt.hour
+                if 6 <= h < 14:
+                    shift = "DAY 교대조"
+                elif 14 <= h < 22:
+                    shift = "EVENING 교대조"
+                else:
+                    shift = "NIGHT 교대조"
+            except Exception:
+                shift = "교대조 미확인"
+        else:
+            shift = "교대조 미확인"
+
+        result.append({
+            "id":       r["id"],
+            "shift":    shift,
+            "briefing": r["briefing"] or "",
+        })
+    return result
+
+
+# ── 9. POST /api/v8/admin/handovers/{id}/ack ──────────────────────
+
+@app.post(
+    "/api/v8/admin/handovers/{handover_id}/ack",
+    status_code=202,
+    tags=["v8 대시보드"],
+)
+def v8_admin_ack_handover(handover_id: str):
+    """
+    인수인계 확인(승인) — care_record_outbox pending→done 상태 전환.
+    노션 연동 BypassStub: 실 API 호출 없이 로그만 기록.
+    """
+    if engine is None:
+        raise HTTPException(503, "DB 미연결")
+    with engine.begin() as conn:
+        result = conn.execute(text("""
+            UPDATE care_record_outbox
+               SET status = 'done', processed_at = NOW()
+             WHERE id = :id::uuid AND status = 'pending'
+        """), {"id": handover_id})
+        if result.rowcount == 0:
+            raise HTTPException(404, "해당 인수인계 항목이 없습니다.")
+    # ── 노션 연동 BypassStub ──────────────────────────────────────
+    logger.info(f"[BYPASS-NOTION] handover ack id={handover_id}")
+    return {"accepted": True, "id": handover_id}
 
 
 if __name__ == "__main__":

@@ -1,0 +1,48 @@
+steps:
+  # 1. Docker 이미지 빌드
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api:$BUILD_ID'
+      - '-t'
+      - 'asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api:latest'
+      - '.'
+
+  # 2. Artifact Registry에 푸시
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api:$BUILD_ID'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api:latest'
+
+  # 3. Cloud Run 배포
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'voice-guard-api'
+      - '--image=asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api:$BUILD_ID'
+      - '--region=asia-northeast3'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--memory=1Gi'
+      - '--cpu=1'
+      - '--min-instances=0'
+      - '--max-instances=5'
+      - '--timeout=60'
+      - '--set-secrets=DATABASE_URL=DATABASE_URL:latest,SECRET_KEY=SECRET_KEY:latest,APP_ENV=APP_ENV:latest,ALLOWED_ORIGINS=ALLOWED_ORIGINS:latest,B2_KEY_ID=B2_KEY_ID:latest,B2_APPLICATION_KEY=B2_APPLICATION_KEY:latest,B2_BUCKET_NAME=B2_BUCKET_NAME:latest,B2_ENDPOINT_URL=B2_ENDPOINT_URL:latest,GEMINI_MODEL=GEMINI_MODEL:latest,NOTION_HANDOVER_TITLE_PROP=NOTION_HANDOVER_TITLE_PROP:latest,ALIMTALK_OVERDUE_MINUTES=ALIMTALK_OVERDUE_MINUTES:latest,NOTION_CARE_RECORD_DB_ID=NOTION_CARE_RECORD_DB_ID:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest,NOTION_API_KEY=NOTION_API_KEY:latest,NOTION_DATABASE_ID=NOTION_DATABASE_ID:latest,NOTION_HANDOVER_DB_ID=NOTION_HANDOVER_DB_ID:latest,SOLAPI_API_KEY=SOLAPI_API_KEY:latest,SOLAPI_API_SECRET=SOLAPI_API_SECRET:latest,KAKAO_SENDER_KEY=KAKAO_SENDER_KEY:latest,ALIMTALK_TPL_NT1=ALIMTALK_TPL_NT1:latest,ALIMTALK_TPL_NT2=ALIMTALK_TPL_NT2:latest,ALIMTALK_TPL_NT3=ALIMTALK_TPL_NT3:latest,ADMIN_PHONE=ADMIN_PHONE:latest,DEFAULT_FACILITY_PHONE=DEFAULT_FACILITY_PHONE:latest'
+      - '--quiet'
+
+images:
+  - 'asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api:$BUILD_ID'
+  - 'asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_MEDIUM'
