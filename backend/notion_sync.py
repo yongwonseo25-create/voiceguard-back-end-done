@@ -525,11 +525,19 @@ async def notion_create_care_record_page(
     record_id: str = str(payload.get("record_id", ""))
 
     beneficiary_name = str(cr.get("beneficiary_id") or "미확인")[:50]
-    recorded_at      = str(cr.get("recorded_at") or "")[:30]
+    recorded_at_raw  = str(cr.get("recorded_at") or "")
 
     # recorded_at 폴백: 누락 시 현재 UTC
-    if not recorded_at:
-        recorded_at = datetime.now(tz.utc).isoformat()
+    if not recorded_at_raw:
+        recorded_at_raw = datetime.now(tz.utc).isoformat()
+
+    # Notion date 필드: 마이크로초 제거 후 +00:00 고정 (ISO 8601 완전 형식 보장)
+    # 예) "2026-04-15T12:26:21.981242+00:00" → "2026-04-15T12:26:21+00:00"
+    try:
+        _parsed = datetime.fromisoformat(recorded_at_raw.replace("Z", "+00:00"))
+        recorded_at = _parsed.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    except Exception:
+        recorded_at = recorded_at_raw[:19] + "+00:00"
 
     # 날짜 단축 표기 (갤러리 타이틀 가독성)
     date_short = recorded_at[:10]  # "2026-04-10"
