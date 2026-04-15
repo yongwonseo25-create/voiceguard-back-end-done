@@ -1,3 +1,23 @@
+## 🔒 프로젝트 인프라 맥락 및 4대 절대 규칙 (신규 에이전트 최우선 독해)
+
+### 규칙 1 (인프라 맥락)
+본 프로젝트는 **Voice Guard B2B MVP**다. 백엔드 파이프라인은
+**Firebase App Hosting + Cloud Run(voice-guard-api) + Cloud SQL(PostgreSQL WORM 원장) + Secret Manager**
+구글 생태계 정식 레일 위에 완공되어 있다. 이 인프라를 건드리지 마라.
+
+### 규칙 2 (마이크 앱 진입점 강제)
+Firebase 기본 URL(`https://voice-guard-pilot.web.app/`) 접속 시 **즉각 모바일 마이크 녹음 앱 UI**가 떠야 한다.
+원장 관제탑 대시보드는 `/admin` 경로에 묶인다. 단일 프론트엔드(`Directer_Dashboard/`)로 구성한다.
+
+### 규칙 3 (파이프라인 고정)
+데이터 흐름: **[마이크 음성 투척 → POST /api/v2/ingest → Whisper → Gemini → PostgreSQL WORM 원장 → 대시보드 표출]**
+이 순서를 절대 바꾸지 마라.
+
+### 규칙 4 (키 인식 오류 원천 차단)
+`GEMINI_API_KEY`는 Google AI Studio Key와 동일하다. 별도로 제미나이 키를 요구하거나 생성하지 마라.
+
+---
+
 ## ⚖️ 법적 증거 인프라 선언 (최상위 불변 원칙)
 > **본 시스템은 '6대 필수기록(식사, 투약, 배설, 체위변경, 위생, 특이사항)'과
 > WORM 해시체인 증거 원장을 다루는 법적 증거 인프라다.
