@@ -116,28 +116,27 @@ ALLOWED_ORIGINS=ALLOWED_ORIGINS:latest" \
     needs: deploy-backend
 
     steps:
-      - name: Checkout
+      - name: Checkout (서브모듈 포함)
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Node.js 설정
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: Directer_Dashboard/package-lock.json
+          cache-dependency-path: "FRONT END/package-lock.json"
 
       - name: 의존성 설치
-        working-directory: Directer_Dashboard
+        working-directory: "FRONT END"
         run: npm ci
 
-      - name: 프로덕션 빌드 (API URL 자동 주입)
-        working-directory: Directer_Dashboard
-        env:
-          VITE_API_BASE_URL: ${{ needs.deploy-backend.outputs.api_url }}
+      - name: 프로덕션 빌드
+        working-directory: "FRONT END"
         run: |
-          echo "VITE_API_BASE_URL=$VITE_API_BASE_URL" > .env.production
           npm run build
-          echo "✅ 프론트엔드 빌드 완료 (API: $VITE_API_BASE_URL)"
+          echo "✅ 프론트엔드 빌드 완료"
 
       - name: Firebase Hosting 배포
         uses: FirebaseExtended/action-hosting-deploy@v0
