@@ -6,9 +6,8 @@
 #        → 프론트엔드 빌드(API URL 주입) → Firebase Hosting 배포
 #
 # 사전 준비 (1회): scripts/bootstrap_gcp.sh 실행 후
-#   GitHub > Settings > Secrets에 다음 2개만 등록
-#   - GCP_SA_KEY            : bootstrap이 출력하는 JSON (base64)
-#   - FIREBASE_SERVICE_ACCOUNT : bootstrap이 출력하는 JSON
+#   GitHub > Settings > Secrets에 다음 1개만 등록
+#   - GCP_SA_KEY : SA JSON (base64) — Cloud Run + Firebase 공용
 # ══════════════════════════════════════════════════════════════════
 
 name: Deploy Voice Guard
@@ -133,6 +132,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: GCP 인증 (Firebase 배포용)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
       - name: Node.js 설정
         uses: actions/setup-node@v4
         with:
@@ -150,13 +154,11 @@ jobs:
           npm run build
           echo "✅ 프론트엔드 빌드 완료"
 
-      - name: Firebase Hosting 배포
-        uses: FirebaseExtended/action-hosting-deploy@v0
-        with:
-          repoToken: ${{ secrets.GITHUB_TOKEN }}
-          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          projectId: ${{ env.FIREBASE_PROJECT }}
-          channelId: live
+      - name: Firebase CLI 설치 및 Hosting 배포
+        run: |
+          npm install -g firebase-tools
+          firebase deploy --only hosting --project ${{ env.FIREBASE_PROJECT }} --non-interactive
+          echo "✅ Firebase Hosting 배포 완료"
 
       - name: 배포 완료 보고
         run: |
