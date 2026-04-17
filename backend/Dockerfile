@@ -15,7 +15,7 @@ WORKDIR /app
 
 # 의존성 먼저 설치 (레이어 캐시 최적화)
 COPY requirements-api.txt .
-RUN pip install --no-cache-dir -r requirements-api.txt
+RUN pip install --no-cache-dir --retries 3 --timeout 60 -r requirements-api.txt
 
 # 소스 복사 (. env는 제외 — Secret Manager에서 주입)
 COPY . .
@@ -27,4 +27,4 @@ ENV PORT=8080
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers 2
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "2"]
