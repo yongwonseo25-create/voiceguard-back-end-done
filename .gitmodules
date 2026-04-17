@@ -1,0 +1,4 @@
+[submodule "FRONT END"]
+	path = FRONT END
+	url = https://github.com/yongwonseer25-create/voice-guard-frontend.git
+	branch = main

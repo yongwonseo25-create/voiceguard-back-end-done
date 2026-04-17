@@ -51,6 +51,7 @@ from angel_bridge import router as angel_router, init_angel_bridge
 from angel_export import router as angel_export_router, init_angel_export
 from angel_rpa import router as angel_rpa_router, init_angel_rpa
 from env_guard import check_env_vars
+from notion_pipeline import run_pipeline as notion_run_pipeline
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1464,13 +1465,17 @@ def v8_admin_handovers():
     status_code=202,
     tags=["v8 대시보드"],
 )
-def v8_admin_ack_handover(handover_id: str):
+async def v8_admin_ack_handover(handover_id: str):
     """
-    인수인계 확인(승인) — care_record_outbox pending→done 상태 전환.
-    노션 연동 BypassStub: 실 API 호출 없이 로그만 기록.
+    인수인계 확인(ACK) — care_record_outbox pending→done 상태 전환.
+    [Closed-Loop] DB 커밋 후 Notion 파이프라인 fire-and-forget 실행.
+    Notion 실패는 로그만 기록, DB 커밋은 이미 완료 상태 유지.
     """
     if engine is None:
         raise HTTPException(503, "DB 미연결")
+
+    # ── DB 업데이트 + 케어 기록 조회 (단일 트랜잭션) ──────────────
+    care_row = None
     with engine.begin() as conn:
         result = conn.execute(text("""
             UPDATE care_record_outbox
@@ -1479,9 +1484,213 @@ def v8_admin_ack_handover(handover_id: str):
         """), {"id": handover_id})
         if result.rowcount == 0:
             raise HTTPException(404, "해당 인수인계 항목이 없습니다.")
-    # ── 노션 연동 BypassStub ──────────────────────────────────────
-    logger.info(f"[BYPASS-NOTION] handover ack id={handover_id}")
+
+        # Notion 파이프라인에 넘길 케어 기록 조회
+        care_row = conn.execute(text("""
+            SELECT c.id::text        AS record_id,
+                   c.facility_id,
+                   c.beneficiary_id,
+                   c.caregiver_id,
+                   c.raw_voice_text,
+                   c.recorded_at::text AS recorded_at
+            FROM care_record_outbox o
+            JOIN care_record_ledger  c ON c.id = o.record_id
+            WHERE o.id = :id::uuid
+        """), {"id": handover_id}).fetchone()
+
+    # ── [Closed-Loop] Notion 파이프라인 fire-and-forget ───────────
+    if care_row:
+        asyncio.create_task(_fire_notion_pipeline(
+            facility_id=care_row.facility_id    or "demo",
+            beneficiary_id=care_row.beneficiary_id or "demo",
+            caregiver_id=care_row.caregiver_id  or "demo",
+            care_record_id=care_row.record_id,
+            raw_voice_text=care_row.raw_voice_text or "",
+            recorded_at=care_row.recorded_at,
+            label="ACK-NOTION",
+        ))
+        logger.info(f"[ACK] ✅ Notion 파이프라인 예약: handover={handover_id}")
+    else:
+        logger.warning(f"[ACK] care_record 조회 실패 — Notion 파이프라인 건너뜀: id={handover_id}")
+
     return {"accepted": True, "id": handover_id}
+
+
+# ══════════════════════════════════════════════════════════════════
+# [헬퍼] ACK / 로그 저장 후 Notion 파이프라인 비동기 실행
+# fire-and-forget — DB 커밋 이후 독립 실행, 실패해도 응답 차단 없음
+# ══════════════════════════════════════════════════════════════════
+
+async def _fire_notion_pipeline(
+    facility_id:    str,
+    beneficiary_id: str,
+    caregiver_id:   str,
+    care_record_id: str,
+    raw_voice_text: str,
+    recorded_at:    Optional[str],
+    label:          str = "NOTION",
+) -> None:
+    gemini_care_json: dict = {
+        "meal":          {"done": False},
+        "medication":    {"done": False},
+        "excretion":     {"done": False},
+        "repositioning": {"done": False},
+        "hygiene":       {"done": False},
+        "special_notes": {"done": True, "detail": raw_voice_text[:500]},
+    }
+    try:
+        result = await notion_run_pipeline(
+            gemini_care_json=gemini_care_json,
+            facility_id=facility_id,
+            beneficiary_id=beneficiary_id,
+            caregiver_id=caregiver_id,
+            care_record_id=care_record_id,
+            raw_voice_text=raw_voice_text,
+            recorded_at=recorded_at,
+        )
+        logger.info(
+            f"[{label}] ✅ Notion 파이프라인 완료: "
+            f"hot={result['hot_path']['success']} "
+            f"cold_ok={result['cold_path']['success']}/{result['cold_path']['total']} "
+            f"care={care_record_id[:8]}…"
+        )
+    except Exception as exc:
+        logger.error(f"[{label}] ❌ Notion 파이프라인 실패 (DB 커밋은 유지): {exc}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# [FRONT-BRIDGE] POST /api/logs
+#
+# FRONT END api.ts saveLog(text) 수신 → care_record_ledger 적재
+# + Notion 파이프라인 fire-and-forget
+# ══════════════════════════════════════════════════════════════════
+
+class LogBody(BaseModel):
+    text:      str
+    timestamp: Optional[str] = None
+
+
+@app.post("/api/logs", status_code=202, tags=["프론트 연동"])
+async def post_log(body: LogBody):
+    """
+    FRONT END api.ts saveLog() 수신 엔드포인트.
+    care_record_ledger/outbox 단일 트랜잭션 적재 후
+    Notion 파이프라인 비동기 실행.
+    """
+    if not body.text.strip():
+        raise HTTPException(422, "text 는 필수값입니다.")
+    if engine is None:
+        raise HTTPException(503, "DB 미연결")
+
+    server_ts   = datetime.now(timezone.utc)
+    record_id   = str(uuid4())
+    recorded_at = body.timestamp or server_ts.isoformat()
+
+    outbox_payload = json.dumps({
+        "record_id":      record_id,
+        "facility_id":    "demo",
+        "beneficiary_id": "demo",
+        "caregiver_id":   "demo",
+        "raw_voice_text": body.text,
+        "recorded_at":    recorded_at,
+        "server_ts":      server_ts.isoformat(),
+    }, ensure_ascii=False)
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO care_record_ledger (
+                    id, facility_id, beneficiary_id, caregiver_id,
+                    raw_voice_text, server_ts, recorded_at
+                ) VALUES (
+                    :id, :facility_id, :beneficiary_id, :caregiver_id,
+                    :raw_voice_text, :server_ts, :recorded_at
+                )
+            """), {
+                "id":             record_id,
+                "facility_id":    "demo",
+                "beneficiary_id": "demo",
+                "caregiver_id":   "demo",
+                "raw_voice_text": body.text,
+                "server_ts":      server_ts,
+                "recorded_at":    recorded_at,
+            })
+            conn.execute(text("""
+                INSERT INTO care_record_outbox (
+                    id, record_id, status, attempts, payload, created_at
+                ) VALUES (
+                    :id, :record_id, 'pending', 0,
+                    CAST(:payload AS jsonb), :created_at
+                )
+            """), {
+                "id":         str(uuid4()),
+                "record_id":  record_id,
+                "payload":    outbox_payload,
+                "created_at": server_ts,
+            })
+    except Exception as e:
+        logger.error(f"[API-LOGS] DB 오류: {e}")
+        raise HTTPException(500, str(e))
+
+    # Notion 파이프라인 fire-and-forget
+    asyncio.create_task(_fire_notion_pipeline(
+        facility_id="demo",
+        beneficiary_id="demo",
+        caregiver_id="demo",
+        care_record_id=record_id,
+        raw_voice_text=body.text,
+        recorded_at=recorded_at,
+        label="API-LOGS-NOTION",
+    ))
+
+    logger.info(f"[API-LOGS] ✅ 저장 완료: record={record_id}")
+    return {"success": True, "record_id": record_id, "accepted": True}
+
+
+# ══════════════════════════════════════════════════════════════════
+# [FRONT-BRIDGE] POST /api/kakao/send
+#
+# FRONT END api.ts sendKakao(text) 수신 → 긴급 알림톡 fan-out
+# ══════════════════════════════════════════════════════════════════
+
+class KakaoSendBody(BaseModel):
+    text: str
+
+
+@app.post("/api/kakao/send", status_code=202, tags=["프론트 연동"])
+async def post_kakao_send(body: KakaoSendBody):
+    """
+    FRONT END api.ts sendKakao() 수신 엔드포인트.
+    긴급 상황 원장 + 관리자 알림톡 fan-out 실행.
+    Idempotency-Key 자동 생성 — FE 헤더 불필요.
+    """
+    if not body.text.strip():
+        raise HTTPException(422, "text 는 필수값입니다.")
+
+    idem_key = str(uuid4())  # FE가 헤더를 안 보내도 되도록 서버 자동 생성
+    targets  = [p for p in (EMERGENCY_RECIPIENTS or [DEFAULT_FACILITY_PHONE]) if p]
+
+    if not targets:
+        logger.warning("[API-KAKAO] 수신자 명단 비어있음 — 환경변수 미설정, 로그만 기록")
+        return {"success": True, "sent": 0, "message": "수신자 미설정"}
+
+    variables = {
+        "#{발화내용}": body.text[:800],
+        "#{발생시각}": datetime.now(timezone.utc).isoformat(),
+        "#{심각도}":   "normal",
+    }
+
+    sent, failed = fanout_alimtalk(
+        engine=engine,
+        phones=targets,
+        template_code=ALIMTALK_TPL_EMERGENCY,
+        variables=variables,
+        trigger_type="KAKAO-SEND",
+        idempotency_key=idem_key,
+    )
+
+    logger.info(f"[API-KAKAO] 알림톡 발송 — sent={sent} failed={failed}")
+    return {"success": True, "sent": sent, "failed": failed}
 
 
 if __name__ == "__main__":
