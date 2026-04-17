@@ -100,10 +100,11 @@ fi
 # IAM 역할 부여
 for ROLE in \
     "roles/run.admin" \
-    "roles/artifactregistry.writer" \
+    "roles/artifactregistry.admin" \
     "roles/secretmanager.secretAccessor" \
     "roles/iam.serviceAccountUser" \
-    "roles/cloudbuild.builds.builder"; do
+    "roles/cloudbuild.builds.builder" \
+    "roles/serviceusage.serviceUsageAdmin"; do
     gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
         --member="serviceAccount:${SA_EMAIL}" \
         --role="${ROLE}" \
