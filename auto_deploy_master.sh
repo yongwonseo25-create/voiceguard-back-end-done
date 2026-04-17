@@ -10,12 +10,12 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${PROJECT_ROOT}"
 
-GCP_PROJECT="voice-guard-pilot"
+GCP_PROJECT="upbeat-aura-484502-r2"
 GCP_REGION="asia-northeast3"
 SERVICE_NAME="voice-guard-api"
 REPO_NAME="voice-guard"
 IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${REPO_NAME}/api"
-FIREBASE_PROJECT="${GCP_PROJECT}"
+FIREBASE_PROJECT="voice-guard-pilot"
 TIMESTAMP=$(date +%Y%m%d%H%M%S)
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -36,7 +36,7 @@ fail() {
         *"billing"*)  echo "  원인: GCP 빌링 미연결"
                       echo "  해결: https://console.cloud.google.com/billing 에서 연결" ;;
         *"npm"*)      echo "  원인: Node.js 의존성 문제"
-                      echo "  해결: cd Directer_Dashboard && npm install 실행 후 재시도" ;;
+                      echo "  해결: cd 'FRONT END' && npm install 실행 후 재시도" ;;
         *)            echo "  로그를 확인하십시오: /tmp/vg_deploy_${TIMESTAMP}.log" ;;
     esac
     echo "══════════════════════════════════════════════════════════"
@@ -139,7 +139,7 @@ ok "백엔드 배포 완료: ${API_URL}"
 
 # ── STEP 6: 프론트엔드 빌드 ─────────────────────────────────────
 info "프론트엔드 빌드 중 (API URL 주입: ${API_URL})..."
-cd Directer_Dashboard
+cd "FRONT END"
 npm ci --silent || fail "npm install 실패"
 echo "VITE_API_BASE_URL=${API_URL}" > .env.production
 VITE_API_BASE_URL="${API_URL}" npm run build || fail "npm run build 실패"

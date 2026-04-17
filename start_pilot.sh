@@ -70,7 +70,7 @@ cd ..
 # [STEP 2] 프론트엔드 기동 (포트 3000 강제 고정)
 # ──────────────────────────────────────────────────────────────────
 echo "[2/2] 프론트엔드 서버(포트 3000) 기동 중..."
-cd Directer_Dashboard
+cd "FRONT END"
 npm run dev > /tmp/vg_frontend.log 2>&1 &
 FRONTEND_PID=$!
 echo "      [OK] 프론트엔드 PID: $FRONTEND_PID"

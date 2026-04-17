@@ -9,8 +9,9 @@
 set -euo pipefail
 
 # ── 설정 ──────────────────────────────────────────────────────────
-GCP_PROJECT="voice-guard-pilot"
+GCP_PROJECT="upbeat-aura-484502-r2"
 GCP_REGION="asia-northeast3"
+FIREBASE_PROJECT="voice-guard-pilot"
 SA_NAME="voice-guard-deployer"
 SA_EMAIL="${SA_NAME}@${GCP_PROJECT}.iam.gserviceaccount.com"
 REPO_NAME="voice-guard"
@@ -149,17 +150,18 @@ ok "Secret Manager 등록 완료 (${#ENV_VARS[@]}개)"
 
 # ── Firebase 서비스 계정 생성 ─────────────────────────────────────
 FB_SA_NAME="firebase-deployer"
-FB_SA_EMAIL="${FB_SA_NAME}@${GCP_PROJECT}.iam.gserviceaccount.com"
+FB_SA_EMAIL="${FB_SA_NAME}@${FIREBASE_PROJECT}.iam.gserviceaccount.com"
 
-if ! gcloud iam service-accounts describe "${FB_SA_EMAIL}" &>/dev/null; then
+if ! gcloud iam service-accounts describe "${FB_SA_EMAIL}" --project="${FIREBASE_PROJECT}" &>/dev/null; then
     gcloud iam service-accounts create "${FB_SA_NAME}" \
+        --project="${FIREBASE_PROJECT}" \
         --display-name="Firebase Deployer" \
         --quiet
 fi
 for ROLE in \
     "roles/firebase.admin" \
     "roles/firebasehosting.admin"; do
-    gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
+    gcloud projects add-iam-policy-binding "${FIREBASE_PROJECT}" \
         --member="serviceAccount:${FB_SA_EMAIL}" \
         --role="${ROLE}" \
         --quiet 2>/dev/null || true
@@ -168,8 +170,9 @@ done
 FB_KEY_FILE="/tmp/vg_fb_key.json"
 gcloud iam service-accounts keys create "${FB_KEY_FILE}" \
     --iam-account="${FB_SA_EMAIL}" \
+    --project="${FIREBASE_PROJECT}" \
     --quiet
-ok "Firebase 서비스 계정 키 발급"
+ok "Firebase 서비스 계정 키 발급 (프로젝트: ${FIREBASE_PROJECT})"
 
 # ── GitHub 시크릿 자동 등록 ──────────────────────────────────────
 if command -v gh &>/dev/null && gh auth status &>/dev/null; then
