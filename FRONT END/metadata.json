@@ -1,0 +1,7 @@
+{
+  "name": "보이스가드 앱 ui/ux최종 본",
+  "description": "A simple, highly legible voice recording app for work logs and messaging, designed for seniors.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
