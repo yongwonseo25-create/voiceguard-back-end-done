@@ -1,5 +1,14 @@
 {
   "projects": {
-    "default": "voice-guard-pilot"
+    "default": "upbeat-aura-484502-r2"
+  },
+  "targets": {
+    "upbeat-aura-484502-r2": {
+      "hosting": {
+        "app": [
+          "voice-guard-app"
+        ]
+      }
+    }
   }
 }

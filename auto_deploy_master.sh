@@ -15,7 +15,7 @@ GCP_REGION="asia-northeast3"
 SERVICE_NAME="voice-guard-api"
 REPO_NAME="voice-guard"
 IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${REPO_NAME}/api"
-FIREBASE_PROJECT="voice-guard-pilot"
+FIREBASE_PROJECT="upbeat-aura-484502-r2"
 TIMESTAMP=$(date +%Y%m%d%H%M%S)
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -169,7 +169,7 @@ echo "  ✅ 터미널 복구 및 좀비 프로세스 폭파 완료!"
 echo "  ✅ Cloud Run + Firebase 정식 배포 완료!"
 echo ""
 echo "  🌐 프론트엔드 (외부망 접속):                             "
-echo "     https://voice-guard-pilot.web.app                     "
+echo "     https://voice-guard-app.web.app                       "
 echo ""
 echo "  📡 백엔드 API:                                           "
 echo "     ${API_URL}                                            "

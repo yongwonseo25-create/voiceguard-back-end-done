@@ -1,6 +1,6 @@
 {
   "hosting": {
-    "site": "voice-guard-pilot",
+    "site": "voice-guard-app",
     "public": "FRONT END/dist",
     "ignore": [
       "firebase.json",
