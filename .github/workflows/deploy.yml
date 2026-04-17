@@ -19,10 +19,10 @@ on:
   workflow_dispatch:          # 수동 트리거 버튼
 
 env:
-  GCP_PROJECT:   sales-lab-20260220-v1
+  GCP_PROJECT:   voice-guard-pilot
   GCP_REGION:    asia-northeast3
   SERVICE_NAME:  voice-guard-api
-  IMAGE_REPO:    asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api
+  IMAGE_REPO:    asia-northeast3-docker.pkg.dev/voice-guard-pilot/voice-guard/api
   FIREBASE_PROJECT: voice-guard-pilot
 
 jobs:

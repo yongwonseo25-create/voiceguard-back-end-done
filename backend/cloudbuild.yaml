@@ -4,21 +4,21 @@ steps:
     args:
       - 'build'
       - '-t'
-      - 'asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api:$BUILD_ID'
+      - 'asia-northeast3-docker.pkg.dev/voice-guard-pilot/voice-guard/api:$BUILD_ID'
       - '-t'
-      - 'asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api:latest'
+      - 'asia-northeast3-docker.pkg.dev/voice-guard-pilot/voice-guard/api:latest'
       - '.'
 
   # 2. Artifact Registry에 푸시
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
-      - 'asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api:$BUILD_ID'
+      - 'asia-northeast3-docker.pkg.dev/voice-guard-pilot/voice-guard/api:$BUILD_ID'
 
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
-      - 'asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api:latest'
+      - 'asia-northeast3-docker.pkg.dev/voice-guard-pilot/voice-guard/api:latest'
 
   # 3. Cloud Run 배포
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
@@ -27,7 +27,7 @@ steps:
       - 'run'
       - 'deploy'
       - 'voice-guard-api'
-      - '--image=asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api:$BUILD_ID'
+      - '--image=asia-northeast3-docker.pkg.dev/voice-guard-pilot/voice-guard/api:$BUILD_ID'
       - '--region=asia-northeast3'
       - '--platform=managed'
       - '--allow-unauthenticated'
@@ -40,8 +40,8 @@ steps:
       - '--quiet'
 
 images:
-  - 'asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api:$BUILD_ID'
-  - 'asia-northeast3-docker.pkg.dev/sales-lab-20260220-v1/voice-guard/api:latest'
+  - 'asia-northeast3-docker.pkg.dev/voice-guard-pilot/voice-guard/api:$BUILD_ID'
+  - 'asia-northeast3-docker.pkg.dev/voice-guard-pilot/voice-guard/api:latest'
 
 options:
   logging: CLOUD_LOGGING_ONLY
