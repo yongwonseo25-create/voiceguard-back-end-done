@@ -61,18 +61,41 @@ jobs:
 
       - name: Cloud Run 배포
         run: |
-          SECRETS="DATABASE_URL=DATABASE_URL:latest,SECRET_KEY=SECRET_KEY:latest,B2_KEY_ID=B2_KEY_ID:latest,B2_APPLICATION_KEY=B2_APPLICATION_KEY:latest,B2_BUCKET_NAME=B2_BUCKET_NAME:latest,B2_ENDPOINT_URL=B2_ENDPOINT_URL:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest,GEMINI_MODEL=GEMINI_MODEL:latest,NOTION_API_KEY=NOTION_API_KEY:latest,NOTION_DATABASE_ID=NOTION_DATABASE_ID:latest,NOTION_HANDOVER_DB_ID=NOTION_HANDOVER_DB_ID:latest,NOTION_CARE_RECORD_DB_ID=NOTION_CARE_RECORD_DB_ID:latest,NOTION_HANDOVER_TITLE_PROP=NOTION_HANDOVER_TITLE_PROP:latest,SOLAPI_API_KEY=SOLAPI_API_KEY:latest,SOLAPI_API_SECRET=SOLAPI_API_SECRET:latest,KAKAO_SENDER_KEY=KAKAO_SENDER_KEY:latest,ALIMTALK_TPL_NT1=ALIMTALK_TPL_NT1:latest,ALIMTALK_TPL_NT2=ALIMTALK_TPL_NT2:latest,ALIMTALK_TPL_NT3=ALIMTALK_TPL_NT3:latest,ADMIN_PHONE=ADMIN_PHONE:latest,DEFAULT_FACILITY_PHONE=DEFAULT_FACILITY_PHONE:latest,ALIMTALK_OVERDUE_MINUTES=ALIMTALK_OVERDUE_MINUTES:latest,APP_ENV=APP_ENV:latest,ALLOWED_ORIGINS=ALLOWED_ORIGINS:latest"
           gcloud run deploy ${{ env.SERVICE_NAME }} \
-            --image ${{ env.IMAGE_REPO }}:${{ github.sha }} \
-            --region ${{ env.GCP_REGION }} \
-            --platform managed \
+            --image     "${{ env.IMAGE_REPO }}:${{ github.sha }}" \
+            --region    ${{ env.GCP_REGION }} \
+            --platform  managed \
             --allow-unauthenticated \
-            --memory 1Gi \
-            --cpu 1 \
+            --memory    1Gi \
+            --cpu       1 \
             --min-instances 0 \
             --max-instances 5 \
-            --timeout 60 \
-            --set-secrets "$SECRETS" \
+            --timeout   60 \
+            --set-secrets "$(printf '%s' \
+              'DATABASE_URL=DATABASE_URL:latest,' \
+              'SECRET_KEY=SECRET_KEY:latest,' \
+              'B2_KEY_ID=B2_KEY_ID:latest,' \
+              'B2_APPLICATION_KEY=B2_APPLICATION_KEY:latest,' \
+              'B2_BUCKET_NAME=B2_BUCKET_NAME:latest,' \
+              'B2_ENDPOINT_URL=B2_ENDPOINT_URL:latest,' \
+              'GEMINI_API_KEY=GEMINI_API_KEY:latest,' \
+              'GEMINI_MODEL=GEMINI_MODEL:latest,' \
+              'NOTION_API_KEY=NOTION_API_KEY:latest,' \
+              'NOTION_DATABASE_ID=NOTION_DATABASE_ID:latest,' \
+              'NOTION_HANDOVER_DB_ID=NOTION_HANDOVER_DB_ID:latest,' \
+              'NOTION_CARE_RECORD_DB_ID=NOTION_CARE_RECORD_DB_ID:latest,' \
+              'NOTION_HANDOVER_TITLE_PROP=NOTION_HANDOVER_TITLE_PROP:latest,' \
+              'SOLAPI_API_KEY=SOLAPI_API_KEY:latest,' \
+              'SOLAPI_API_SECRET=SOLAPI_API_SECRET:latest,' \
+              'KAKAO_SENDER_KEY=KAKAO_SENDER_KEY:latest,' \
+              'ALIMTALK_TPL_NT1=ALIMTALK_TPL_NT1:latest,' \
+              'ALIMTALK_TPL_NT2=ALIMTALK_TPL_NT2:latest,' \
+              'ALIMTALK_TPL_NT3=ALIMTALK_TPL_NT3:latest,' \
+              'ADMIN_PHONE=ADMIN_PHONE:latest,' \
+              'DEFAULT_FACILITY_PHONE=DEFAULT_FACILITY_PHONE:latest,' \
+              'ALIMTALK_OVERDUE_MINUTES=ALIMTALK_OVERDUE_MINUTES:latest,' \
+              'APP_ENV=APP_ENV:latest,' \
+              'ALLOWED_ORIGINS=ALLOWED_ORIGINS:latest')" \
             --quiet
 
       - name: Cloud Run URL 추출
