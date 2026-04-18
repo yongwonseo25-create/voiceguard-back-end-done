@@ -2053,9 +2053,13 @@ async def post_work_record(body: WorkRecordBody):
 # ══════════════════════════════════════════════════════════════════
 
 class HandoverBody(BaseModel):
-    text:      str
-    timestamp: Optional[str] = None
-    source:    str = "handover_badge"  # 인수인계 버튼 고정 식별자
+    text:           str
+    timestamp:      Optional[str] = None
+    source:         str = "handover_badge"
+    # G-03: 실제 식별자 — 미제공 시 Notion Relation 생략 (WORM 봉인은 영향 없음)
+    facility_id:    Optional[str] = None
+    beneficiary_id: Optional[str] = None
+    caregiver_id:   Optional[str] = None
 
 
 @app.post("/api/v8/handover", status_code=202, tags=["인수인계 듀얼 라우팅"])
@@ -2203,11 +2207,16 @@ async def post_handover(body: HandoverBody):
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # FORK B — Notion 워크스페이스 (care_record_ledger → 인수인계 DB)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # G-03: 제공된 실제 ID 우선, 미제공 시 폴백 (WORM 봉인과 무관)
+    fork_b_facility    = (body.facility_id    or "handover").strip() or "handover"
+    fork_b_beneficiary = (body.beneficiary_id or "resident_user").strip() or "resident_user"
+    fork_b_caregiver   = (body.caregiver_id   or "handover_staff").strip() or "handover_staff"
+
     notion_payload = json.dumps({
         "record_id":       record_id,
-        "facility_id":     "handover",
-        "beneficiary_id":  "resident_user",
-        "caregiver_id":    "handover_staff",
+        "facility_id":     fork_b_facility,
+        "beneficiary_id":  fork_b_beneficiary,
+        "caregiver_id":    fork_b_caregiver,
         "raw_voice_text":  body.text,
         "recorded_at":     recorded_at,
         "server_ts":       server_ts.isoformat(),
@@ -2226,9 +2235,9 @@ async def post_handover(body: HandoverBody):
                 )
             """), {
                 "id":             record_id,
-                "facility_id":    "handover",
-                "beneficiary_id": "resident_user",
-                "caregiver_id":   "handover_staff",
+                "facility_id":    fork_b_facility,
+                "beneficiary_id": fork_b_beneficiary,
+                "caregiver_id":   fork_b_caregiver,
                 "raw_voice_text": body.text,
                 "server_ts":      server_ts,
                 "recorded_at":    recorded_at,
@@ -2253,11 +2262,11 @@ async def post_handover(body: HandoverBody):
         # Fork B 실패는 경고만 — Fork A(WORM)는 이미 봉인 완료
         logger.error(f"[HANDOVER] Fork B Notion DB 적재 실패 (WORM 봉인은 유지): {e}")
 
-    # Fork B — Notion 파이프라인 fire-and-forget
+    # Fork B — Notion 파이프라인 fire-and-forget (동적 ID 사용)
     asyncio.create_task(_fire_notion_pipeline(
-        facility_id="handover",
-        beneficiary_id="resident_user",
-        caregiver_id="handover_staff",
+        facility_id=fork_b_facility,
+        beneficiary_id=fork_b_beneficiary,
+        caregiver_id=fork_b_caregiver,
         care_record_id=record_id,
         raw_voice_text=body.text,
         recorded_at=recorded_at,

@@ -275,53 +275,112 @@ _CARE_RECORD_KEYS = (
     "special_notes",  # 특이사항 (← TD-04: 6번째 의무기록 복원)
 )
 
-CARE_RECORD_SCHEMA_VERSION = "2.1"
+CARE_RECORD_SCHEMA_VERSION = "2.2"
 
-_CARE_RECORD_SYSTEM_PROMPT = """당신은 요양보호사의 현장 발화를 6대 의무기록 카테고리로 분류하는 의료 기록 보조 시스템입니다.
+# v2.1 → v2.2 변경 요약:
+#   1. corrected_transcript 신규 필드 (오탈자 교정 전체 발화)
+#   2. detail: string → {situation, action, notes} 구조화 객체
+#   3. 의료용어 표준화 매핑 + 3단 객관 요약 강제
+_CARE_RECORD_SYSTEM_PROMPT = """당신은 요양보호사의 현장 발화를 6대 의무기록으로 정제하는 법적 증거 기록 시스템입니다.
+
+[Step 1: 오탈자·발음오류 교정]
+발화 원문에서 명백한 오탈자와 발음 오류를 먼저 교정하십시오.
+교정된 전체 발화를 corrected_transcript 필드에 기재하십시오.
+교정할 내용이 없으면 원문 그대로 기재하십시오.
+
+[Step 2: 의료용어 표준화 — 아래 매핑 규칙을 반드시 적용하십시오]
+- "이상 없음/별이상없음/별다른 없음" → "특이소견 없음"
+- "약 드렸어요/약 먹었어요/약 챙겨드렸어요" → "투약 완료"
+- "화장실 다녀오셨어요/볼일 봤어요/대소변" → "배설 수행"
+- "자세 바꿔드렸어요/뒤집어드렸어요/자세 변경" → "체위변경 수행"
+- "씻겨드렸어요/목욕시켜드렸어요/세면" → "위생관리 수행"
+- "넘어지실 뻔/쓰러지려고/낙상 위험" → "낙상 위험 발생"
+- "열 있어요/열나는 것 같아요/체온 높음" → "발열 증상 관찰"
+- "밥 드셨어요/식사하셨어요/드셨어요" → "식사 수행"
+
+[Step 3: 6대 카테고리 분류 + 3단 객관 요약]
+각 카테고리별로 done 여부를 판단하고, done=true인 항목은 detail을 3단 구조로 작성하십시오.
+- situation: 관찰된 사실 (예: "오전 9시 식사 보조 시행")
+- action:    수행한 케어 내용 (예: "죽 200ml 전량 섭취 보조")
+- notes:     비정상 소견 또는 "특이소견 없음"
+done=false인 항목은 detail을 null로 설정하십시오.
 
 [필수 지침]
 1. 반드시 아래 JSON 스키마를 100% 준수하십시오. 임의 필드 추가 금지.
-2. 6대 카테고리(meal, medication, excretion, repositioning, hygiene, special_notes)는
-   반드시 모두 존재해야 합니다.
-   음성에서 언급이 없으면 반드시 done=false, detail=null로 채우십시오.
-3. done 값은 반드시 boolean(true/false)만 사용하십시오. 문자열 "true" 금지.
-4. detail은 음성에서 언급된 내용만 기재하십시오. 추측 금지.
-5. special_notes(특이사항)는 5개 표준 카테고리(식사·투약·배설·체위변경·위생)
-   어디에도 해당하지 않는 중요한 관찰/사건을 기재하십시오.
-   특이사항이 있으면 done=true, detail=상세내용.
-   없으면 done=false, detail=null.
+2. 6대 카테고리는 반드시 모두 존재해야 합니다. 언급 없으면 done=false, detail=null.
+3. done 값은 반드시 boolean(true/false)만 사용하십시오. 문자열 금지.
+4. detail 내용은 발화에서 확인된 사실만 기재하십시오. 추측·생성 절대 금지.
+5. special_notes는 5개 표준 카테고리 외 중요 관찰/사건만 기재하십시오.
 
 [폴백 규칙 — 절대 준수]
-- 언급 없는 카테고리 → done=false, detail=null (에러 금지, null 반환 금지)
-- 수급자 ID 불명 → beneficiary_id="" (빈 문자열, null 금지)
-- 기록 일시 불명 → recorded_at="" (빈 문자열, null 금지)
+- 언급 없는 카테고리 → done=false, detail=null
+- 수급자 ID 불명 → beneficiary_id="" (null 금지)
+- 기록 일시 불명 → recorded_at="" (null 금지)
+- corrected_transcript 교정 불가 → 원문 그대로 기재
 
-[출력 JSON 스키마 — 6대 의무기록 동일 구조]
+[출력 JSON 스키마 v2.2]
 {
-  "schema_version": "2.1",
+  "schema_version": "2.2",
   "beneficiary_id": "string",
   "recorded_at":    "YYYY-MM-DDTHH:MM:SS",
-  "meal":           { "done": true/false, "detail": "string or null" },
-  "medication":     { "done": true/false, "detail": "string or null" },
-  "excretion":      { "done": true/false, "detail": "string or null" },
-  "repositioning":  { "done": true/false, "detail": "string or null" },
-  "hygiene":        { "done": true/false, "detail": "string or null" },
-  "special_notes":  { "done": true/false, "detail": "string or null" }
+  "corrected_transcript": "string",
+  "meal":           { "done": true/false, "detail": {"situation": "string", "action": "string", "notes": "string"} or null },
+  "medication":     { "done": true/false, "detail": {"situation": "string", "action": "string", "notes": "string"} or null },
+  "excretion":      { "done": true/false, "detail": {"situation": "string", "action": "string", "notes": "string"} or null },
+  "repositioning":  { "done": true/false, "detail": {"situation": "string", "action": "string", "notes": "string"} or null },
+  "hygiene":        { "done": true/false, "detail": {"situation": "string", "action": "string", "notes": "string"} or null },
+  "special_notes":  { "done": true/false, "detail": {"situation": "string", "action": "string", "notes": "string"} or null }
 }
 
 [출력 형식]
 순수 JSON만 반환하십시오. 마크다운 코드 블록(```), 설명 텍스트 일체 금지."""
 
 
+def _sanitize_detail(raw_detail: object, is_long: bool = False) -> Optional[dict]:
+    """
+    v2.2 detail 필드 정규화 — {situation, action, notes} 구조화 객체 강제.
+
+    하위 호환:
+      - v2.1 string detail → situation에 승격, action/notes="특이소견 없음"
+      - null / 빈값 → None 반환
+    """
+    if raw_detail is None:
+        return None
+
+    max_sub = 500 if is_long else 200
+
+    if isinstance(raw_detail, dict):
+        situation = str(raw_detail.get("situation") or "")[:max_sub].strip()
+        action    = str(raw_detail.get("action")    or "")[:max_sub].strip()
+        notes     = str(raw_detail.get("notes")     or "")[:max_sub].strip()
+        if not situation and not action and not notes:
+            return None
+        return {
+            "situation": situation or "미상",
+            "action":    action    or "미상",
+            "notes":     notes     or "특이소견 없음",
+        }
+
+    # v2.1 string 하위 호환: 문자열 → situation으로 승격
+    if isinstance(raw_detail, str) and raw_detail.strip():
+        return {
+            "situation": raw_detail.strip()[:max_sub],
+            "action":    "미상",
+            "notes":     "특이소견 없음",
+        }
+
+    return None
+
+
 def _sanitize_care_record(raw: dict, metadata: dict) -> dict:
     """
-    Gemini 응답 null-safe 정규화 (6대 의무기록 전용).
+    Gemini 응답 null-safe 정규화 (6대 의무기록 전용) v2.2.
 
-    안전망 원칙 (TD-04 반영):
-    - 6대 카테고리(special_notes 포함) 키 누락/null → {"done":False,"detail":None}
+    안전망 원칙:
+    - 6대 카테고리 키 누락/null → {"done": False, "detail": None}
     - done 값 bool() 강제 캐스팅 — Gemini "true" 문자열 방어
-    - detail 길이 제한: 5개 표준은 200자, special_notes는 2000자
-    - 구버전 응답(special_notes가 string 또는 null)도 호환 처리
+    - detail: v2.2 구조화 객체 강제, v2.1 string 하위 호환
+    - corrected_transcript 누락 → raw_voice_text 폴백
     - schema_version 불일치 → 경고 로그 (파이프라인은 계속)
     """
     schema_ver = raw.get("schema_version", "unknown")
@@ -334,25 +393,15 @@ def _sanitize_care_record(raw: dict, metadata: dict) -> dict:
     result: dict = {}
 
     for key in _CARE_RECORD_KEYS:
-        # special_notes는 detail 길이를 더 넉넉하게 (관찰/사건 서술 공간)
-        max_detail = 2000 if key == "special_notes" else 200
-        item = raw.get(key)
+        is_long = (key == "special_notes")
+        item    = raw.get(key)
 
         if isinstance(item, dict) and "done" in item:
-            # 정상 v2.1 구조
             result[key] = {
                 "done":   bool(item.get("done", False)),
-                "detail": (str(item["detail"])[:max_detail] if item.get("detail") else None),
-            }
-        elif key == "special_notes" and isinstance(item, str) and item.strip():
-            # 구버전 v2.0 호환: special_notes가 문자열로 온 경우
-            # → done=True, detail=문자열 로 자동 승격
-            result[key] = {
-                "done":   True,
-                "detail": item.strip()[:max_detail],
+                "detail": _sanitize_detail(item.get("detail"), is_long=is_long),
             }
         else:
-            # 키 누락 / null / 빈 값 → 기본값 주입 (파이프라인 블로킹 금지)
             result[key] = {"done": False, "detail": None}
 
     result["schema_version"] = CARE_RECORD_SCHEMA_VERSION
@@ -362,6 +411,11 @@ def _sanitize_care_record(raw: dict, metadata: dict) -> dict:
     result["recorded_at"] = str(
         raw.get("recorded_at") or metadata.get("recorded_at", "")
     )[:30]
+    # corrected_transcript: Gemini 교정 발화, 없으면 원문 폴백
+    raw_voice = metadata.get("raw_voice_text", "")
+    result["corrected_transcript"] = str(
+        raw.get("corrected_transcript") or raw_voice
+    )[:5000]
 
     return result
 
@@ -379,11 +433,15 @@ async def call_gemini_care_record(
 
     Args:
         raw_voice_text: 현장 발화 원문 텍스트
-        metadata:       {beneficiary_id, facility_id, recorded_at, ...}
+        metadata:       {beneficiary_id, facility_id, recorded_at, raw_voice_text, ...}
         client:         호출자가 공유하는 httpx.AsyncClient (없으면 내부 생성)
     Returns:
-        schema_version="2.0" 보장된 구조화 dict
+        schema_version="2.2" 보장된 구조화 dict
     """
+    # metadata에 raw_voice_text 주입 — corrected_transcript 폴백용
+    if "raw_voice_text" not in metadata:
+        metadata = {**metadata, "raw_voice_text": raw_voice_text}
+
     if not GEMINI_API_KEY:
         logger.warning("[GEMINI-CARE] GEMINI_API_KEY 미설정 — 기본값 JSON 반환")
         return _sanitize_care_record({}, metadata)
@@ -403,7 +461,7 @@ async def call_gemini_care_record(
         ],
         "generationConfig": {
             "temperature":      0.1,
-            "maxOutputTokens":  512,
+            "maxOutputTokens":  1024,   # v2.2: 3단 구조화 detail로 토큰 증가
             "responseMimeType": "application/json",
         },
     }

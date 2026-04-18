@@ -78,16 +78,27 @@ _CACHE_TTL_SEC  = 3600.0    # 1시간 캐시 TTL
 # ══════════════════════════════════════════════════════════════════
 
 class CareFlag(BaseModel):
-    """6대 의무기록 단일 카테고리 — done 플래그 + 세부 메모"""
-    done:   bool            = False
-    detail: Optional[str]   = None
+    """6대 의무기록 단일 카테고리 — done 플래그 + 3단 요약 객체 (v2.2)"""
+    done:   bool             = False
+    detail: Optional[dict]   = None
 
     @field_validator("detail", mode="before")
     @classmethod
-    def truncate_detail(cls, v: object) -> Optional[str]:
+    def normalize_detail(cls, v: object) -> Optional[dict]:
+        """v2.2 dict 정상 경로 + v2.1 string 하위 호환."""
         if v is None:
             return None
-        return str(v)[:2000]
+        if isinstance(v, dict):
+            if not any(v.get(k) for k in ("situation", "action", "notes")):
+                return None
+            return {
+                "situation": str(v.get("situation") or "")[:500],
+                "action":    str(v.get("action")    or "")[:500],
+                "notes":     str(v.get("notes")     or "특이소견 없음")[:500],
+            }
+        # v2.1 string 하위 호환 — situation으로 승격
+        s = str(v).strip()[:500]
+        return {"situation": s, "action": "미상", "notes": "특이소견 없음"} if s else None
 
 
 class CareRecordInput(BaseModel):
@@ -110,6 +121,9 @@ class CareRecordInput(BaseModel):
     repositioning:  CareFlag = Field(default_factory=CareFlag)
     hygiene:        CareFlag = Field(default_factory=CareFlag)
     special_notes:  CareFlag = Field(default_factory=CareFlag)
+
+    # ── Gemini 교정 발화 (v2.2 신규 — 없으면 raw_voice_text 폴백)
+    corrected_transcript: Optional[str] = None
 
     # ── 타임스탬프 (선택, 없으면 서버 현재 시각 사용)
     recorded_at: Optional[str] = None
@@ -140,7 +154,7 @@ class AtomicCareEvent(BaseModel):
     caregiver_id:   str
     category:       str   # meal / medication / excretion / repositioning / hygiene / special_notes
     done:           bool
-    detail:         Optional[str]
+    detail:         Optional[dict]   # v2.2: {situation, action, notes}
     recorded_at:    str
 
 
@@ -307,8 +321,92 @@ async def lookup_page_id(
 # (제2원칙 Hot Path: 1행, 5대 체크박스, Relation 연결)
 # ══════════════════════════════════════════════════════════════════
 
+_CATEGORY_EMOJI = {
+    "meal":          "🍚",
+    "medication":    "💊",
+    "excretion":     "🚽",
+    "repositioning": "🔄",
+    "hygiene":       "🧼",
+    "special_notes": "📋",
+}
+_CATEGORY_KO = {
+    "meal":          "식사",
+    "medication":    "투약",
+    "excretion":     "배설",
+    "repositioning": "체위변경",
+    "hygiene":       "위생",
+    "special_notes": "특이사항",
+}
+
+
+def _detail_to_rich_text(detail: Optional[dict], max_chars: int = 2000) -> str:
+    """detail dict → Notion rich_text용 단일 문자열."""
+    if not detail:
+        return "특이소견 없음"
+    parts = []
+    if detail.get("situation"):
+        parts.append(f"상황: {detail['situation']}")
+    if detail.get("action"):
+        parts.append(f"조치: {detail['action']}")
+    if detail.get("notes"):
+        parts.append(f"특이: {detail['notes']}")
+    return " | ".join(parts)[:max_chars] if parts else "특이소견 없음"
+
+
+def _build_care_detail_blocks(record: "CareRecordInput") -> list[dict]:
+    """
+    done=True 카테고리의 detail을 Notion 페이지 본문 블록으로 변환.
+    각 카테고리 → callout 블록 (이모지 + 3단 요약 텍스트).
+    """
+    blocks: list[dict] = []
+
+    categories = [
+        ("meal",          record.meal),
+        ("medication",    record.medication),
+        ("excretion",     record.excretion),
+        ("repositioning", record.repositioning),
+        ("hygiene",       record.hygiene),
+        ("special_notes", record.special_notes),
+    ]
+
+    done_items = [(cat, flag) for cat, flag in categories if flag.done]
+    if not done_items:
+        return blocks
+
+    # 섹션 헤더
+    blocks.append({
+        "object": "block",
+        "type":   "heading_3",
+        "heading_3": {
+            "rich_text": [{"type": "text", "text": {"content": "케어 상세 기록"}}],
+            "color": "default",
+        },
+    })
+
+    for cat, flag in done_items:
+        emoji   = _CATEGORY_EMOJI.get(cat, "📌")
+        cat_ko  = _CATEGORY_KO.get(cat, cat)
+        content = _detail_to_rich_text(flag.detail, max_chars=1800)
+        blocks.append({
+            "object": "block",
+            "type":   "callout",
+            "callout": {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {"content": f"[{cat_ko}] {content}"},
+                    }
+                ],
+                "icon":  {"type": "emoji", "emoji": emoji},
+                "color": "gray_background",
+            },
+        })
+
+    return blocks
+
+
 async def create_ops_dashboard_row(
-    record:            CareRecordInput,
+    record:            "CareRecordInput",
     resident_page_id:  Optional[str],
     caregiver_page_id: Optional[str],
     care_record_id:    str,
@@ -319,15 +417,9 @@ async def create_ops_dashboard_row(
 
     제2원칙 Hot Path 규칙:
       - 행 1개만 생성 (복수 행 생성 금지)
-      - 5대 체크박스(식사·투약·배설·체위변경·위생)만 체크
+      - 5대 체크박스(식사·투약·배설·체위변경·위생) 완전 매핑
       - Resident / Caregiver Relation 속성에 Page ID 직접 매핑
-
-    Args:
-        record:            Pydantic 검증 통과한 CareRecordInput
-        resident_page_id:  RESIDENT_DB에서 조회한 Notion Page ID (없으면 Relation 생략)
-        caregiver_page_id: CAREGIVER_DB에서 조회한 Notion Page ID (없으면 Relation 생략)
-        care_record_id:    PostgreSQL care_record_ledger UUID (제목/참조용)
-        client:            공유 httpx.AsyncClient
+      - detail 3단 요약 → 페이지 본문 callout 블록으로 렌더링
 
     Returns:
         (success, notion_page_id_or_none, error_message_or_none)
@@ -335,36 +427,44 @@ async def create_ops_dashboard_row(
     if not NOTION_OPS_DASHBOARD_DB_ID:
         return False, None, "NOTION_OPS_DASHBOARD_DB_ID 미설정 — 사령관 입력 필요"
 
-    # ── 제목 (Title) — 실증 확인 속성명: '보고서 제목' ──────────────
-    ts = record.recorded_at or ""
+    ts         = record.recorded_at or ""
     title_text = (
         f"[{ts[:10] or 'now'}] {record.beneficiary_id} / {record.facility_id}"
     )[:100]
 
-    # ── Notion Properties 구성 (실증 확인 속성명 사용) ───────────
+    # ── 5대 체크박스 + 정제발화 + 특이사항 rich_text ─────────────
+    corrected = (
+        record.corrected_transcript or record.raw_voice_text or ""
+    )[:2000]
+    special_text = _detail_to_rich_text(record.special_notes.detail)
+
     properties: dict = {
-        # Title 속성 (실제 DB 속성명: '보고서 제목')
-        "보고서 제목": {
-            "title": [{"text": {"content": title_text}}]
+        "보고서 제목": {"title": [{"text": {"content": title_text}}]},
+        # ── 5대 체크박스 완전 매핑 (G-02 해소) ────────────────────
+        "식사":     {"checkbox": record.meal.done},
+        "투약":     {"checkbox": record.medication.done},
+        "배설":     {"checkbox": record.excretion.done},
+        "체위변경": {"checkbox": record.repositioning.done},
+        "위생":     {"checkbox": record.hygiene.done},
+        # ── 텍스트 필드 (G-04 해소) ───────────────────────────────
+        "정제발화": {
+            "rich_text": [{"type": "text", "text": {"content": corrected}}]
         },
-        # ── 체크박스 3종 (실증 확인: '식사', '투약', '배설') ────────
-        "식사":  {"checkbox": record.meal.done},
-        "투약":  {"checkbox": record.medication.done},
-        "배설":  {"checkbox": record.excretion.done},
+        "특이사항": {
+            "rich_text": [{"type": "text", "text": {"content": special_text}}]
+        },
     }
 
-    # 기록 일시 (date 타입)
     if record.recorded_at:
         properties["발생일시"] = {"date": {"start": record.recorded_at}}
 
-    # ── 제3원칙: Relation 속성 — Page ID 직접 매핑 ───────────────
-    # 실증 확인 속성명: '입소자 연결', '담당 보호사 연결'
+    # ── 제3원칙: Relation — Page ID 직접 매핑 ────────────────────
     if resident_page_id:
         properties["입소자 연결"] = {"relation": [{"id": resident_page_id}]}
     else:
         logger.warning(
             f"[HOT-PATH] Resident page_id 미발견 — beneficiary_id={record.beneficiary_id!r} "
-            "Relation 속성 생략 (텍스트 대체 금지)"
+            "Relation 속성 생략"
         )
 
     if caregiver_page_id:
@@ -375,23 +475,25 @@ async def create_ops_dashboard_row(
             "Relation 속성 생략"
         )
 
-    # ── API 요청 (제1원칙 재시도 내장) ───────────────────────────
-    body = {
-        "parent":     {"database_id": NOTION_OPS_DASHBOARD_DB_ID},
-        "properties": properties,
-    }
-    url = f"{NOTION_BASE_URL}/pages"
+    # ── 페이지 본문: done=True 카테고리 callout 블록 ──────────────
+    children = _build_care_detail_blocks(record)
 
+    body: dict = {"parent": {"database_id": NOTION_OPS_DASHBOARD_DB_ID}, "properties": properties}
+    if children:
+        body["children"] = children
+
+    url = f"{NOTION_BASE_URL}/pages"
     success, data, err = await _api_request_with_retry(client, "POST", url, json=body)
     if not success:
         return False, None, err
 
-    page_id: str = data.get("id", "") if data else ""
+    page_id: str = (data or {}).get("id", "")
     logger.info(
         f"[HOT-PATH] 1행 생성 완료 — care_record_id={care_record_id[:8]}… "
-        f"notion_page_id={page_id[:8]}… "
-        f"meal={record.meal.done} med={record.medication.done} "
-        f"exc={record.excretion.done} repo={record.repositioning.done} hyg={record.hygiene.done}"
+        f"page_id={page_id[:8]}… "
+        f"meal={record.meal.done} med={record.medication.done} exc={record.excretion.done} "
+        f"repo={record.repositioning.done} hyg={record.hygiene.done} "
+        f"blocks={len(children)}"
     )
     return True, page_id, None
 
@@ -466,14 +568,18 @@ async def push_atomic_event(
     ts = event.recorded_at[:16] if event.recorded_at else ""
     title_text = f"[{event.category}] {ts}"[:100]
 
+    care_content = _detail_to_rich_text(event.detail, max_chars=2000)
+
     properties: dict = {
-        # Title
         "이름": {
             "title": [{"text": {"content": title_text}}]
         },
-        # 카테고리 (select)
         "카테고리": {
             "select": {"name": event.category}
+        },
+        # ── G-04: detail 3단 요약 텍스트 전달 ────────────────────
+        "케어 내용": {
+            "rich_text": [{"type": "text", "text": {"content": care_content}}]
         },
     }
 
@@ -564,7 +670,8 @@ async def run_pipeline(
             facility_id=facility_id,
             beneficiary_id=beneficiary_id,
             caregiver_id=caregiver_id,
-            raw_voice_text=raw_voice_text or gemini_care_json.get("beneficiary_id", "미확인"),
+            raw_voice_text=raw_voice_text or "미확인",
+            corrected_transcript=gemini_care_json.get("corrected_transcript") or raw_voice_text,
             meal=         CareFlag(**gemini_care_json.get("meal",          {"done": False})),
             medication=   CareFlag(**gemini_care_json.get("medication",    {"done": False})),
             excretion=    CareFlag(**gemini_care_json.get("excretion",     {"done": False})),
