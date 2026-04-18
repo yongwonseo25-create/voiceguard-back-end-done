@@ -1251,7 +1251,7 @@ def dashboard_worm_records(
         conditions.append("recorded_at >= :date_from ::timestamptz")
         params["date_from"] = date_from
     if date_to:
-        conditions.append("recorded_at <= (:date_to ::date + INTERVAL '1 day - 1 second')")
+        conditions.append("recorded_at < (:date_to ::date + INTERVAL '1 day')")
         params["date_to"] = date_to
 
     where = " AND ".join(conditions)
@@ -1397,7 +1397,8 @@ def v8_director_decision_queue():
                      WHEN COALESCE(e.audio_sha256,'') != '' THEN 'partial'
                      ELSE 'missing'
                 END                                                         AS evidence_status,
-                e.is_flagged                                                AS flagged
+                e.is_flagged                                                AS flagged,
+                LEFT(e.chain_hash, 12)                                      AS worm_hash_short
             FROM v_evidence_sealed e
             WHERE e.is_flagged = TRUE
                OR EXISTS (
@@ -1450,6 +1451,7 @@ def v8_director_decision_queue():
             "affectedRecipients": affected,
             "evidenceStatus":     r["evidence_status"],
             "riskLevel":          risk,
+            "wormHashShort":      r["worm_hash_short"] or "N/A",
         })
     return result
 
