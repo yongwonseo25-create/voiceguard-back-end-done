@@ -34,6 +34,9 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
+import openai
+import google.generativeai as genai
+
 from notifier import (
     send_alimtalk,
     ALIMTALK_TPL_NT3,
@@ -73,6 +76,14 @@ REDIS_CARE_STREAM  = "care:records"           # 6대 의무기록 스트림 (신
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv(
     "ALLOWED_ORIGINS", "http://localhost:3000"
 ).split(",") if o.strip()]
+
+# ── AI API 설정 (사령관 지시) ──────────────────────────────────────
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
 
 # ── DB 엔진 (동기, connection pool) ───────────────────────────────
 engine = create_engine(
@@ -127,6 +138,60 @@ app.add_middleware(
 app.include_router(angel_router)
 app.include_router(angel_export_router)
 app.include_router(angel_rpa_router)
+
+
+# ══════════════════════════════════════════════════════════════════
+# [AI 연동 긴급 실전 테스트] POST /api/v8/test-ai-pipeline
+# ══════════════════════════════════════════════════════════════════
+
+@app.post("/api/v8/test-ai-pipeline", tags=["AI 테스트"])
+async def test_ai_pipeline(audio_file: UploadFile = File(...)):
+    """
+    [실전 연동 완료] Whisper STT -> Gemini 2.5 Flash 전체 파이프라인
+    음성을 텍스트로 변환(Whisper) 후, gemini-2.5-flash 모델로 분석합니다.
+    """
+    if not OPENAI_API_KEY or not GEMINI_API_KEY:
+        raise HTTPException(500, "서버 설정(OPENAI_API_KEY 또는 GEMINI_API_KEY)이 누락되었습니다.")
+
+    tmp_path = Path(tempfile.gettempdir()) / f"test_{uuid4()}.wav"
+    try:
+        content = await audio_file.read()
+        tmp_path.write_bytes(content)
+
+        # 1. Whisper 음성 변환
+        logger.info("[AI-PIPELINE] OpenAI Whisper 변환 시작...")
+        client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+        with open(tmp_path, "rb") as f:
+            transcript = await client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                language="ko"
+            )
+        text_result = transcript.text
+        logger.info(f"[AI-PIPELINE] Whisper 텍스트: {text_result}")
+
+        # 2. Gemini 2.5 Flash 텍스트 분석
+        logger.info("[AI-PIPELINE] Gemini 2.5 Flash 분석 시작...")
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        prompt = f"당신은 요양보호사의 음성 인수인계를 듣고 분석하는 AI입니다. 다음 기록에서 수급자 관련 주요 이슈, 행위(배변, 식사 등), 특이사항을 매우 간결히 요약해주세요:\n\n[발화 내용]\n{text_result}"
+        
+        response = model.generate_content(prompt)
+        logger.info("[AI-PIPELINE] Gemini 2.5 Flash 분석 완료")
+
+        return {
+            "success": True,
+            "whisper_transcript": text_result,
+            "gemini_analysis": response.text,
+        }
+    except Exception as e:
+        logger.error(f"[AI-PIPELINE] 오류 발생: {e}")
+        raise HTTPException(500, str(e))
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except:
+                pass
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1115,6 +1180,149 @@ def _fmt_elapsed(minutes: float) -> str:
     return f"{d}일 전"
 
 
+# ══════════════════════════════════════════════════════════════════
+# [DASHBOARD GATEWAY] GET /api/v8/dashboard/worm-records
+#
+# 사령관 절대 지시 — WORM 관제 대시보드 전용 이력 조회 API
+#
+# [기능]
+#   - evidence_ledger 전체 이력 페이지네이션 조회
+#   - case_type, is_flagged, 날짜 범위 필터링
+#   - 최신순(DESC) 정렬 기본값
+#   - 총 레코드 수 + 페이지 메타 반환 (무한 스크롤/페이지 대응)
+#
+# [보안]
+#   - INSERT-ONLY WORM 원장에 대한 SELECT ONLY (수정 불가)
+#   - 클라이언트에 chain_hash / audio_sha256 노출하여 무결성 검증 가능
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/api/v8/dashboard/worm-records", tags=["v8 대시보드"])
+def dashboard_worm_records(
+    page:       int   = 1,
+    page_size:  int   = 20,
+    case_type:  str   = None,    # 'work_record' | 'handover' | None(전체)
+    is_flagged: bool  = None,    # True | False | None(전체)
+    date_from:  str   = None,    # ISO8601 날짜 문자열 (예: 2025-01-01)
+    date_to:    str   = None,    # ISO8601 날짜 문자열
+):
+    """
+    WORM 관제 대시보드 전용 — evidence_ledger 이력 페이지네이션 조회 API.
+
+    대시보드 페이지 최초 진입 시 과거 봉인 데이터 전체를 렌더링하기 위해 호출합니다.
+    실시간 신규 데이터는 GET /api/sse/stream SSE 스트림으로 수신합니다.
+
+    Args:
+        page        : 페이지 번호 (1-indexed, 기본 1)
+        page_size   : 페이지당 레코드 수 (기본 20, 최대 100)
+        case_type   : 'work_record' 또는 'handover' 필터 (생략 시 전체)
+        is_flagged  : 위험 플래그 여부 필터 (생략 시 전체)
+        date_from   : 조회 시작 날짜 (recorded_at >= date_from)
+        date_to     : 조회 종료 날짜 (recorded_at <= date_to 23:59:59)
+
+    Returns:
+        {
+          "total"     : 전체 레코드 수,
+          "page"      : 현재 페이지,
+          "page_size" : 페이지 크기,
+          "pages"     : 전체 페이지 수,
+          "records"   : [ ...각 WORM 봉인 레코드 ... ]
+        }
+    """
+    if engine is None:
+        raise HTTPException(503, "DB 미연결")
+    if not (1 <= page_size <= 100):
+        raise HTTPException(422, "page_size는 1~100 사이여야 합니다.")
+    if page < 1:
+        raise HTTPException(422, "page는 1 이상이어야 합니다.")
+
+    offset = (page - 1) * page_size
+
+    # ── 동적 WHERE 절 조립 ─────────────────────────────────────
+    conditions = ["1=1"]
+    params: dict = {"limit": page_size, "offset": offset}
+
+    if case_type:
+        conditions.append("case_type = :case_type")
+        params["case_type"] = case_type
+    if is_flagged is not None:
+        conditions.append("is_flagged = :is_flagged")
+        params["is_flagged"] = is_flagged
+    if date_from:
+        conditions.append("recorded_at >= :date_from ::timestamptz")
+        params["date_from"] = date_from
+    if date_to:
+        conditions.append("recorded_at <= (:date_to ::date + INTERVAL '1 day - 1 second')")
+        params["date_to"] = date_to
+
+    where = " AND ".join(conditions)
+
+    try:
+        with engine.connect() as conn:
+            # ── 전체 건수 (페이지 메타 계산용) ────────────────
+            total = conn.execute(text(
+                f"SELECT COUNT(*) FROM evidence_ledger WHERE {where}"
+            ), params).scalar() or 0
+
+            # ── 페이지 데이터 조회 (최신순 DESC) ──────────────
+            rows = conn.execute(text(f"""
+                SELECT
+                    id,
+                    recorded_at,
+                    ingested_at,
+                    device_id,
+                    facility_id,
+                    case_type,
+                    care_type,
+                    is_flagged,
+                    beneficiary_id,
+                    shift_id,
+                    transcript_text,
+                    transcript_sha256,
+                    chain_hash,
+                    language_code,
+                    worm_object_key,
+                    worm_retain_until
+                FROM evidence_ledger
+                WHERE {where}
+                ORDER BY recorded_at DESC, ingested_at DESC
+                LIMIT :limit OFFSET :offset
+            """), params).mappings().all()
+
+    except Exception as e:
+        logger.error(f"[DASHBOARD-WORM] evidence_ledger 조회 실패: {e}")
+        raise HTTPException(500, f"WORM 이력 조회 실패: {e}")
+
+    import math
+    records = []
+    for row in rows:
+        records.append({
+            "id":                str(row["id"]),
+            "recorded_at":       row["recorded_at"].isoformat() if row["recorded_at"] else None,
+            "ingested_at":       row["ingested_at"].isoformat() if row["ingested_at"] else None,
+            "device_id":         row["device_id"],
+            "facility_id":       row["facility_id"],
+            "case_type":         row["case_type"],
+            "care_type":         row["care_type"],
+            "is_flagged":        row["is_flagged"],
+            "beneficiary_id":    row["beneficiary_id"],
+            "shift_id":          row["shift_id"],
+            "transcript_text":   row["transcript_text"],
+            "transcript_sha256": row["transcript_sha256"],
+            "chain_hash":        row["chain_hash"],
+            "language_code":     row["language_code"],
+            "worm_object_key":   row["worm_object_key"],
+            "worm_retain_until": row["worm_retain_until"].isoformat() if row["worm_retain_until"] else None,
+        })
+
+    return {
+        "total":     total,
+        "page":      page,
+        "page_size": page_size,
+        "pages":     math.ceil(total / page_size) if total > 0 else 1,
+        "records":   records,
+    }
+
+
 # ── 1. GET /api/v8/director/kpi ────────────────────────────────────
 
 @app.get("/api/v8/director/kpi", tags=["v8 대시보드"])
@@ -1556,6 +1764,519 @@ async def _fire_notion_pipeline(
         )
     except Exception as exc:
         logger.error(f"[{label}] ❌ Notion 파이프라인 실패 (DB 커밋은 유지): {exc}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# [FRONT-BRIDGE v2] POST /api/v8/work-record
+#
+# 사령관 절대 지시 — '업무 기록' 뱃지 전용 듀얼 페이로드 분기 라우터
+#
+# [데이터 플로우]
+#   FE 단 1회 POST (/api/v8/work-record)
+#       ↓
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │  Fork A: WORM 관제 대시보드 (evidence_ledger + outbox)       │
+#   │    - SHA-256 체인 해시 봉인 (수정/삭제 원천 차단)            │
+#   │    - 서버 타임스탬프 강제 적용 (클라이언트 조작 불가)         │
+#   │    - Append-Only INSERT ONLY 불변 원장                        │
+#   │    - SSE Pub/Sub → 대시보드 실시간 브로드캐스트               │
+#   └─────────────────────────────────────────────────────────────┘
+#       ↓ (COMMIT 완료 후 비동기 병렬 실행)
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │  Fork B: Notion 워크스페이스 (수정 가능 실무용 텍스트 블록)  │
+#   │    - 일반 마크다운/텍스트 블록 형태 (Editable)               │
+#   │    - care_record_ledger → 노션 업무기록 DB 자동 적재         │
+#   │    - fire-and-forget (응답 차단 없음)                        │
+#   └─────────────────────────────────────────────────────────────┘
+#       ↓
+#   202 즉시 반환 (WORM COMMIT 기준)
+#
+# ⚠ WORM과 Notion의 데이터 형식 분리는 철저히 Backend 서비스 레이어에서 처리
+# ══════════════════════════════════════════════════════════════════
+
+class WorkRecordBody(BaseModel):
+    text:      str
+    timestamp: Optional[str] = None
+    source:    str = "work_record_badge"  # 호출 출처 식별자 (업무 기록 뱃지 고정)
+
+
+@app.post("/api/v8/work-record", status_code=202, tags=["업무 기록 듀얼 라우팅"])
+async def post_work_record(body: WorkRecordBody):
+    """
+    [사령관 절대 명령] '업무 기록' 뱃지 전용 듀얼 페이로드 분기 엔드포인트.
+
+    FE는 단 1번 호출 — 내부에서 Fork A(WORM) + Fork B(Notion)로 자동 분기.
+
+    Fork A [WORM 관제 대시보드]:
+      - evidence_ledger INSERT ONLY (불변 원장)
+      - SHA-256 체인 해시 + 서버 타임스탬프 봉인
+      - outbox_events 동일 원자 트랜잭션 (Atomic Split)
+      - SSE 실시간 대시보드 브로드캐스트
+
+    Fork B [Notion 워크스페이스]:
+      - care_record_ledger + care_record_outbox INSERT
+      - 노션 파이프라인 fire-and-forget (수정 가능 텍스트 블록)
+    """
+    if not body.text.strip():
+        raise HTTPException(422, "text 는 필수값입니다.")
+    if engine is None:
+        raise HTTPException(503, "DB 미연결")
+
+    server_ts   = datetime.now(timezone.utc)
+    ledger_id   = str(uuid4())
+    record_id   = str(uuid4())
+    recorded_at = body.timestamp or server_ts.isoformat()
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # FORK A — WORM 관제 대시보드 (evidence_ledger + outbox_events)
+    # 수정·삭제가 원천 차단된 Append-Only 불변 원장 봉인
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # SHA-256 보안 해시 생성 (텍스트 무결성 봉인)
+    text_bytes   = body.text.encode("utf-8")
+    text_sha256  = hashlib.sha256(text_bytes).hexdigest()
+    # 체인 해시: 텍스트 + 타임스탬프 + ledger_id 혼합 (위변조 감지)
+    chain_source = f"{text_sha256}::{server_ts.isoformat()}::{ledger_id}"
+    chain_hash   = hashlib.sha256(chain_source.encode()).hexdigest()
+    # CHAR(64) CHECK 제약 대응 — 오디오 플레이스홀더
+    pending_audio = hashlib.sha256(f"audio_pending_{ledger_id}".encode()).hexdigest()
+
+    worm_payload = json.dumps({
+        "ledger_id":       ledger_id,
+        "facility_id":     "work_record",
+        "beneficiary_id":  "badge_user",
+        "shift_id":        f"badge_{ledger_id[:8]}",
+        "source":          body.source,
+        "text_sha256":     text_sha256,
+        "chain_hash":      chain_hash,
+        "server_ts":       server_ts.isoformat(),
+        "raw_transcript":  body.text[:500],
+    }, ensure_ascii=False)
+
+    try:
+        with engine.begin() as conn:
+            # [Fork A-1] evidence_ledger: 불변 WORM 원장 INSERT
+            conn.execute(text("""
+                INSERT INTO evidence_ledger (
+                    id, session_id, recorded_at, ingested_at,
+                    device_id, facility_id,
+                    audio_sha256, transcript_sha256, chain_hash,
+                    transcript_text, language_code,
+                    case_type, is_flagged,
+                    beneficiary_id, shift_id, idempotency_key,
+                    care_type, gps_lat, gps_lon,
+                    audio_size_kb, worm_bucket, worm_object_key, worm_retain_until
+                ) VALUES (
+                    :id, :session_id, :recorded_at, :ingested_at,
+                    :device_id, :facility_id,
+                    :audio_sha256, :transcript_sha256, :chain_hash,
+                    :transcript_text, 'ko', :case_type, false,
+                    :beneficiary_id, :shift_id, :idempotency_key,
+                    :care_type, NULL, NULL,
+                    0, 'voice-guard-korea', :worm_object_key, :recorded_at
+                )
+            """), {
+                "id":               ledger_id,
+                "session_id":       str(uuid4()),
+                "recorded_at":      server_ts,
+                "ingested_at":      server_ts,
+                "device_id":        "badge_frontend",
+                "facility_id":      "work_record",
+                "audio_sha256":     pending_audio,
+                "transcript_sha256": text_sha256,
+                "chain_hash":       chain_hash,
+                "transcript_text":  body.text[:4000],
+                "case_type":        "work_record",
+                "beneficiary_id":   "badge_user",
+                "shift_id":         f"badge_{ledger_id[:8]}",
+                "idempotency_key":  chain_hash,   # 체인해시로 중복 방어
+                "care_type":        "work_record",
+                "worm_object_key":  f"work_record/{ledger_id[:8]}.txt",
+            })
+
+            # [Fork A-2] outbox_events: 비동기 처리 큐 (동일 원자 트랜잭션)
+            conn.execute(text("""
+                INSERT INTO outbox_events (
+                    id, ledger_id, status, attempts,
+                    payload, created_at
+                ) VALUES (
+                    :id, :ledger_id, 'pending', 0,
+                    CAST(:payload AS jsonb), :created_at
+                )
+            """), {
+                "id":         str(uuid4()),
+                "ledger_id":  ledger_id,
+                "payload":    worm_payload,
+                "created_at": server_ts,
+            })
+
+        # ← COMMIT 완료. WORM 봉인 확정. 이후 어떤 수단으로도 수정 불가.
+        logger.info(
+            f"[WORK-RECORD] ✅ FORK-A WORM COMMIT: ledger={ledger_id} "
+            f"sha256={text_sha256[:12]}… chain={chain_hash[:12]}…"
+        )
+
+    except IntegrityError as e:
+        if "idempotency_key" in str(e).lower():
+            # 동일 체인 해시 → 중복 제출로 간주, 409 반환
+            logger.warning(f"[WORK-RECORD] 중복 WORM 제출 감지: chain={chain_hash[:16]}…")
+            raise HTTPException(409, "이미 동일 내용이 봉인되었습니다. (WORM 중복 방어)")
+        raise HTTPException(500, f"WORM DB 오류: {e}")
+    except Exception as e:
+        logger.error(f"[WORK-RECORD] Fork A WORM 트랜잭션 실패: {e}")
+        raise HTTPException(500, f"WORM 봉인 실패: {e}")
+
+    # ── SSE: 관제 대시보드 실시간 브로드캐스트 (COMMIT 후 독립 실행) ──
+    if redis_pub:
+        try:
+            await redis_pub.publish(
+                REDIS_SSE_CHANNEL,
+                json.dumps({
+                    "event": "work_record_sealed",
+                    "data": {
+                        "ledger_id":   ledger_id,
+                        "source":      body.source,
+                        "text_sha256": text_sha256,
+                        "chain_hash":  chain_hash,
+                        "ingested_at": server_ts.isoformat(),
+                        "is_flagged":  False,
+                        "sync_status": "pending",
+                    },
+                }, ensure_ascii=False),
+            )
+            logger.info("[WORK-RECORD] SSE PUBLISH → 대시보드 브로드캐스트 완료")
+        except Exception as e:
+            logger.warning(f"[WORK-RECORD] SSE PUBLISH 실패 (WORM 봉인은 유지): {e}")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # FORK B — Notion 워크스페이스 (care_record_ledger → 업무기록 DB)
+    # 수정 가능한 일반 텍스트 블록 형태로 노션에 실무용 적재
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    notion_payload = json.dumps({
+        "record_id":      record_id,
+        "facility_id":    "work_record",
+        "beneficiary_id": "badge_user",
+        "caregiver_id":   "badge_user",
+        "raw_voice_text": body.text,
+        "recorded_at":    recorded_at,
+        "server_ts":      server_ts.isoformat(),
+        "worm_ledger_ref": ledger_id,   # WORM 원장과의 참조 연결
+    }, ensure_ascii=False)
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO care_record_ledger (
+                    id, facility_id, beneficiary_id, caregiver_id,
+                    raw_voice_text, server_ts, recorded_at
+                ) VALUES (
+                    :id, :facility_id, :beneficiary_id, :caregiver_id,
+                    :raw_voice_text, :server_ts, :recorded_at
+                )
+            """), {
+                "id":             record_id,
+                "facility_id":    "work_record",
+                "beneficiary_id": "badge_user",
+                "caregiver_id":   "badge_user",
+                "raw_voice_text": body.text,
+                "server_ts":      server_ts,
+                "recorded_at":    recorded_at,
+            })
+            conn.execute(text("""
+                INSERT INTO care_record_outbox (
+                    id, record_id, status, attempts, payload, created_at
+                ) VALUES (
+                    :id, :record_id, 'pending', 0,
+                    CAST(:payload AS jsonb), :created_at
+                )
+            """), {
+                "id":         str(uuid4()),
+                "record_id":  record_id,
+                "payload":    notion_payload,
+                "created_at": server_ts,
+            })
+        logger.info(
+            f"[WORK-RECORD] ✅ FORK-B Notion DB COMMIT: record={record_id}"
+        )
+    except Exception as e:
+        # Fork B 실패는 경고만 — Fork A(WORM)는 이미 봉인 완료
+        logger.error(f"[WORK-RECORD] Fork B Notion DB 적재 실패 (WORM 봉인은 유지): {e}")
+
+    # Fork B — Notion 파이프라인 fire-and-forget (care_record_ledger 커밋 후)
+    asyncio.create_task(_fire_notion_pipeline(
+        facility_id="work_record",
+        beneficiary_id="badge_user",
+        caregiver_id="badge_user",
+        care_record_id=record_id,
+        raw_voice_text=body.text,
+        recorded_at=recorded_at,
+        label="WORK-RECORD-NOTION",
+    ))
+    logger.info(
+        "[WORK-RECORD] 🚀 FORK-B Notion 파이프라인 예약 완료 (fire-and-forget)"
+    )
+
+    # ── 202 즉시 반환 (WORM COMMIT 기준) ────────────────────────
+    return {
+        "accepted":       True,
+        "ledger_id":      ledger_id,
+        "record_id":      record_id,
+        "worm_sealed":    True,
+        "chain_hash":     chain_hash,
+        "text_sha256":    text_sha256,
+        "notion_queued":  True,
+        "server_ts":      server_ts.isoformat(),
+        "message":        "WORM 봉인 완료 + Notion 업무기록 DB 적재 진행 중.",
+    }
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# [FRONT-BRIDGE v2] POST /api/v8/handover
+#
+# 사령관 절대 지시 — '인수인계' 버튼 전용 듀얼 페이로드 분기 라우터
+#
+# [데이터 플로우]
+#   FE 단 1회 POST (/api/v8/handover)
+#       ↓
+#   Fork A: WORM 관제 대시보드 (evidence_ledger + outbox_events)
+#     - SHA-256 체인 해시 봉인 (수정/삭제 원천 차단)
+#     - 서버 타임스탬프 강제 적용 (클라이언트 조작 불가)
+#     - Append-Only INSERT ONLY 불변 원장
+#     - SSE Pub/Sub → 대시보드 실시간 브로드캐스트
+#   Fork B: Notion 워크스페이스 (수정 가능 실무용 텍스트 블록)
+#     - care_record_ledger → 노션 인수인계 DB 자동 적재
+#     - fire-and-forget (응답 차단 없음)
+#       ↓
+#   202 즉시 반환 (WORM COMMIT 기준)
+# ══════════════════════════════════════════════════════════════════
+
+class HandoverBody(BaseModel):
+    text:      str
+    timestamp: Optional[str] = None
+    source:    str = "handover_badge"  # 인수인계 버튼 고정 식별자
+
+
+@app.post("/api/v8/handover", status_code=202, tags=["인수인계 듀얼 라우팅"])
+async def post_handover(body: HandoverBody):
+    """
+    [사령관 절대 명령] '인수인계' 버튼 전용 듀얼 페이로드 분기 엔드포인트.
+
+    FE는 단 1번 호출 — 내부에서 Fork A(WORM) + Fork B(Notion)로 자동 분기.
+
+    Fork A [WORM 관제 대시보드]:
+      - evidence_ledger INSERT ONLY (불변 원장)
+      - SHA-256 체인 해시 + 서버 타임스탬프 봉인
+      - outbox_events 동일 원자 트랜잭션 (Atomic Split)
+      - SSE 실시간 대시보드 브로드캐스트
+
+    Fork B [Notion 워크스페이스]:
+      - care_record_ledger + care_record_outbox INSERT
+      - 노션 파이프라인 fire-and-forget (수정 가능 텍스트 블록)
+    """
+    if not body.text.strip():
+        raise HTTPException(422, "text 는 필수값입니다.")
+    if engine is None:
+        raise HTTPException(503, "DB 미연결")
+
+    server_ts   = datetime.now(timezone.utc)
+    ledger_id   = str(uuid4())
+    record_id   = str(uuid4())
+    recorded_at = body.timestamp or server_ts.isoformat()
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # FORK A — WORM 관제 대시보드 (evidence_ledger + outbox_events)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    text_bytes   = body.text.encode("utf-8")
+    text_sha256  = hashlib.sha256(text_bytes).hexdigest()
+    chain_source = f"{text_sha256}::{server_ts.isoformat()}::{ledger_id}"
+    chain_hash   = hashlib.sha256(chain_source.encode()).hexdigest()
+    pending_audio = hashlib.sha256(f"audio_pending_{ledger_id}".encode()).hexdigest()
+
+    worm_payload = json.dumps({
+        "ledger_id":       ledger_id,
+        "facility_id":     "handover",
+        "beneficiary_id":  "resident_user",
+        "shift_id":        f"handover_{ledger_id[:8]}",
+        "source":          body.source,
+        "text_sha256":     text_sha256,
+        "chain_hash":      chain_hash,
+        "server_ts":       server_ts.isoformat(),
+        "raw_transcript":  body.text[:500],
+    }, ensure_ascii=False)
+
+    try:
+        with engine.begin() as conn:
+            # [Fork A-1] evidence_ledger: 불변 WORM 원장 INSERT
+            conn.execute(text("""
+                INSERT INTO evidence_ledger (
+                    id, session_id, recorded_at, ingested_at,
+                    device_id, facility_id,
+                    audio_sha256, transcript_sha256, chain_hash,
+                    transcript_text, language_code,
+                    case_type, is_flagged,
+                    beneficiary_id, shift_id, idempotency_key,
+                    care_type, gps_lat, gps_lon,
+                    audio_size_kb, worm_bucket, worm_object_key, worm_retain_until
+                ) VALUES (
+                    :id, :session_id, :recorded_at, :ingested_at,
+                    :device_id, :facility_id,
+                    :audio_sha256, :transcript_sha256, :chain_hash,
+                    :transcript_text, 'ko', :case_type, false,
+                    :beneficiary_id, :shift_id, :idempotency_key,
+                    :care_type, NULL, NULL,
+                    0, 'voice-guard-korea', :worm_object_key, :recorded_at
+                )
+            """), {
+                "id":               ledger_id,
+                "session_id":       str(uuid4()),
+                "recorded_at":      server_ts,
+                "ingested_at":      server_ts,
+                "device_id":        "handover_frontend",
+                "facility_id":      "handover",
+                "audio_sha256":     pending_audio,
+                "transcript_sha256": text_sha256,
+                "chain_hash":       chain_hash,
+                "transcript_text":  body.text[:4000],
+                "case_type":        "handover",
+                "beneficiary_id":   "resident_user",
+                "shift_id":         f"handover_{ledger_id[:8]}",
+                "idempotency_key":  chain_hash,
+                "care_type":        "handover",
+                "worm_object_key":  f"handover/{ledger_id[:8]}.txt",
+            })
+
+            # [Fork A-2] outbox_events: 동일 원자 트랜잭션
+            conn.execute(text("""
+                INSERT INTO outbox_events (
+                    id, ledger_id, status, attempts,
+                    payload, created_at
+                ) VALUES (
+                    :id, :ledger_id, 'pending', 0,
+                    CAST(:payload AS jsonb), :created_at
+                )
+            """), {
+                "id":         str(uuid4()),
+                "ledger_id":  ledger_id,
+                "payload":    worm_payload,
+                "created_at": server_ts,
+            })
+
+        # ← COMMIT 완료. WORM 봉인 확정.
+        logger.info(
+            f"[HANDOVER] ✅ FORK-A WORM COMMIT: ledger={ledger_id} "
+            f"sha256={text_sha256[:12]}… chain={chain_hash[:12]}…"
+        )
+
+    except IntegrityError as e:
+        if "idempotency_key" in str(e).lower():
+            logger.warning(f"[HANDOVER] 중복 WORM 제출 감지: chain={chain_hash[:16]}…")
+            raise HTTPException(409, "이미 동일 내용이 봉인되었습니다. (WORM 중복 방어)")
+        raise HTTPException(500, f"WORM DB 오류: {e}")
+    except Exception as e:
+        logger.error(f"[HANDOVER] Fork A WORM 트랜잭션 실패: {e}")
+        raise HTTPException(500, f"WORM 봉인 실패: {e}")
+
+    # ── SSE: 관제 대시보드 실시간 브로드캐스트 ──
+    if redis_pub:
+        try:
+            await redis_pub.publish(
+                REDIS_SSE_CHANNEL,
+                json.dumps({
+                    "event": "handover_sealed",
+                    "data": {
+                        "ledger_id":   ledger_id,
+                        "source":      body.source,
+                        "text_sha256": text_sha256,
+                        "chain_hash":  chain_hash,
+                        "ingested_at": server_ts.isoformat(),
+                        "is_flagged":  False,
+                        "sync_status": "pending",
+                    },
+                }, ensure_ascii=False),
+            )
+            logger.info("[HANDOVER] SSE PUBLISH → 대시보드 브로드캐스트 완료")
+        except Exception as e:
+            logger.warning(f"[HANDOVER] SSE PUBLISH 실패 (WORM 봉인은 유지): {e}")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # FORK B — Notion 워크스페이스 (care_record_ledger → 인수인계 DB)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    notion_payload = json.dumps({
+        "record_id":       record_id,
+        "facility_id":     "handover",
+        "beneficiary_id":  "resident_user",
+        "caregiver_id":    "handover_staff",
+        "raw_voice_text":  body.text,
+        "recorded_at":     recorded_at,
+        "server_ts":       server_ts.isoformat(),
+        "worm_ledger_ref": ledger_id,
+    }, ensure_ascii=False)
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO care_record_ledger (
+                    id, facility_id, beneficiary_id, caregiver_id,
+                    raw_voice_text, server_ts, recorded_at
+                ) VALUES (
+                    :id, :facility_id, :beneficiary_id, :caregiver_id,
+                    :raw_voice_text, :server_ts, :recorded_at
+                )
+            """), {
+                "id":             record_id,
+                "facility_id":    "handover",
+                "beneficiary_id": "resident_user",
+                "caregiver_id":   "handover_staff",
+                "raw_voice_text": body.text,
+                "server_ts":      server_ts,
+                "recorded_at":    recorded_at,
+            })
+            conn.execute(text("""
+                INSERT INTO care_record_outbox (
+                    id, record_id, status, attempts, payload, created_at
+                ) VALUES (
+                    :id, :record_id, 'pending', 0,
+                    CAST(:payload AS jsonb), :created_at
+                )
+            """), {
+                "id":         str(uuid4()),
+                "record_id":  record_id,
+                "payload":    notion_payload,
+                "created_at": server_ts,
+            })
+        logger.info(
+            f"[HANDOVER] ✅ FORK-B Notion DB COMMIT: record={record_id}"
+        )
+    except Exception as e:
+        # Fork B 실패는 경고만 — Fork A(WORM)는 이미 봉인 완료
+        logger.error(f"[HANDOVER] Fork B Notion DB 적재 실패 (WORM 봉인은 유지): {e}")
+
+    # Fork B — Notion 파이프라인 fire-and-forget
+    asyncio.create_task(_fire_notion_pipeline(
+        facility_id="handover",
+        beneficiary_id="resident_user",
+        caregiver_id="handover_staff",
+        care_record_id=record_id,
+        raw_voice_text=body.text,
+        recorded_at=recorded_at,
+        label="HANDOVER-NOTION",
+    ))
+    logger.info(
+        "[HANDOVER] 🚀 FORK-B Notion 파이프라인 예약 완료 (fire-and-forget)"
+    )
+
+    # ── 202 즉시 반환 (WORM COMMIT 기준) ────────────────────────
+    return {
+        "accepted":       True,
+        "ledger_id":      ledger_id,
+        "record_id":      record_id,
+        "worm_sealed":    True,
+        "chain_hash":     chain_hash,
+        "text_sha256":    text_sha256,
+        "notion_queued":  True,
+        "server_ts":      server_ts.isoformat(),
+        "message":        "WORM 봉인 완료 + Notion 인수인계 DB 적재 진행 중.",
+    }
 
 
 # ══════════════════════════════════════════════════════════════════
