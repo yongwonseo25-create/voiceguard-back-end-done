@@ -54,8 +54,9 @@ NOTION_BASE_URL            = "https://api.notion.com/v1"
 # 제3원칙: 마스터 DB ID — 환경변수 우선, 기본값은 사령관 지정 고정값
 RESIDENT_DB_ID             = os.getenv("RESIDENT_DB_ID",  "3fcdbdd0e3b383e1adf681ca3574b913")
 CAREGIVER_DB_ID            = os.getenv("CAREGIVER_DB_ID", "ac8dbdd0e3b382f9988681d686aca5f0")
-NOTION_OPS_DASHBOARD_DB_ID = os.getenv("NOTION_OPS_DASHBOARD_DB_ID", "")   # 사령관 입력 대기
-NOTION_ATOMIC_EVENTS_DB_ID = os.getenv("NOTION_ATOMIC_EVENTS_DB_ID", "")   # 사령관 입력 대기
+STAFF_DB_ID                = os.getenv("STAFF_DB_ID",     "347dbdd0e3b3804bb570d4a0317f620e")  # VG_직원_DB
+NOTION_OPS_DASHBOARD_DB_ID = os.getenv("NOTION_OPS_DASHBOARD_DB_ID", "")
+NOTION_ATOMIC_EVENTS_DB_ID = os.getenv("NOTION_ATOMIC_EVENTS_DB_ID", "")
 
 # 마스터 DB 조회 속성명 (실증 확인 값)
 RESIDENT_LOOKUP_PROP  = os.getenv("RESIDENT_LOOKUP_PROP",  "수급자번호")
@@ -316,6 +317,57 @@ async def lookup_page_id(
     return page_id or None
 
 
+async def lookup_staff(
+    client:      httpx.AsyncClient,
+    caregiver_id: str,
+) -> tuple[Optional[str], list[str]]:
+    """
+    VG_직원_DB에서 caregiver_id(이름)로 직원 페이지를 찾아
+    (page_id, [user_ids]) 튜플 반환.
+
+    - Relation 매핑용: page_id → "VG_보호사직원_DB" 속성
+    - Person 알림용:   user_ids → "알림용 담당자" 속성
+    - 미발견 시: (None, []) — Hot Path는 graceful skip
+    """
+    if not STAFF_DB_ID or not caregiver_id:
+        return None, []
+
+    url  = f"{NOTION_BASE_URL}/databases/{STAFF_DB_ID}/query"
+    body = {
+        "filter": {
+            "property": "직원코드",
+            "rich_text": {"equals": caregiver_id},
+        },
+        "page_size": 1,
+    }
+
+    success, data, err = await _api_request_with_retry(client, "POST", url, json=body)
+    if not success or not data:
+        logger.warning(f"[STAFF-LOOKUP] 조회 실패 caregiver_id={caregiver_id!r}: {err}")
+        return None, []
+
+    results = data.get("results", [])
+    if not results:
+        logger.warning(f"[STAFF-LOOKUP] 직원 미발견 caregiver_id={caregiver_id!r}")
+        return None, []
+
+    page    = results[0]
+    page_id = page.get("id", "") or None
+
+    # 사람(People) 속성에서 user_ids 추출
+    people_prop = (page.get("properties") or {}).get("사람", {})
+    people_list = people_prop.get("people", [])
+    user_ids    = [p["id"] for p in people_list if p.get("id")]
+
+    if page_id:
+        logger.info(
+            f"[STAFF-LOOKUP] 직원 발견 caregiver_id={caregiver_id!r} "
+            f"page_id={page_id[:8]}… users={len(user_ids)}"
+        )
+
+    return page_id, user_ids
+
+
 # ══════════════════════════════════════════════════════════════════
 # SECTION 4: Hot Path — VG_운영_대시보드_DB 단 1행 생성
 # (제2원칙 Hot Path: 1행, 5대 체크박스, Relation 연결)
@@ -411,6 +463,8 @@ async def create_ops_dashboard_row(
     caregiver_page_id: Optional[str],
     care_record_id:    str,
     client:            httpx.AsyncClient,
+    staff_page_id:     Optional[str]       = None,
+    staff_user_ids:    Optional[list[str]] = None,
 ) -> tuple[bool, Optional[str], Optional[str]]:
     """
     VG_운영_대시보드_DB에 단 1행 생성.
@@ -474,6 +528,14 @@ async def create_ops_dashboard_row(
             f"[HOT-PATH] Caregiver page_id 미발견 — caregiver_id={record.caregiver_id!r} "
             "Relation 속성 생략"
         )
+
+    # ── 이중 매핑: VG_직원_DB Relation + Person 알림 ─────────────
+    if staff_page_id:
+        properties["VG_보호사직원_DB"] = {"relation": [{"id": staff_page_id}]}
+    if staff_user_ids:
+        properties["알림용 담당자"] = {
+            "people": [{"object": "user", "id": uid} for uid in staff_user_ids]
+        }
 
     # ── 페이지 본문: done=True 카테고리 callout 블록 ──────────────
     children = _build_care_detail_blocks(record)
@@ -687,10 +749,14 @@ async def run_pipeline(
 
     async with httpx.AsyncClient() as client:
         # ── Step 2: Relation Page ID 조회 (병렬, 캐시 우선) ──────
-        resident_page_id, caregiver_page_id = await asyncio.gather(
-            lookup_page_id(client, RESIDENT_DB_ID,  RESIDENT_LOOKUP_PROP,  beneficiary_id),
-            lookup_page_id(client, CAREGIVER_DB_ID, CAREGIVER_LOOKUP_PROP, caregiver_id),
-        )
+        (resident_page_id, caregiver_page_id), (staff_page_id, staff_user_ids) = \
+            await asyncio.gather(
+                asyncio.gather(
+                    lookup_page_id(client, RESIDENT_DB_ID,  RESIDENT_LOOKUP_PROP,  beneficiary_id),
+                    lookup_page_id(client, CAREGIVER_DB_ID, CAREGIVER_LOOKUP_PROP, caregiver_id),
+                ),
+                lookup_staff(client, caregiver_id),
+            )
 
         # ── Step 3: Hot Path (1행 생성) ──────────────────────────
         hot_ok, hot_page_id, hot_err = await create_ops_dashboard_row(
@@ -699,6 +765,8 @@ async def run_pipeline(
             caregiver_page_id=caregiver_page_id,
             care_record_id=care_record_id,
             client=client,
+            staff_page_id=staff_page_id,
+            staff_user_ids=staff_user_ids or [],
         )
         result["hot_path"] = {
             "success": hot_ok,
