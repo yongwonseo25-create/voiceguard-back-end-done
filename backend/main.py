@@ -31,6 +31,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadF
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from app_check_middleware import app_check_middleware
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
@@ -131,8 +132,9 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "Cache-Control", "Idempotency-Key"],
+    allow_headers=["Content-Type", "Authorization", "Cache-Control", "Idempotency-Key", "X-Firebase-AppCheck"],
 )
+app.middleware("http")(app_check_middleware)
 
 # ── 엔젤 브리지 라우터 마운트 (기생형 Bounded Context) ──────────
 app.include_router(angel_router)
@@ -586,6 +588,33 @@ async def get_dlq():
         return {"dlq": [dict(r._mapping) for r in rows]}
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+# ══════════════════════════════════════════════════════════════════
+# [UPGRADE-03] /internal/dlq-recovery — Cloud Scheduler 전용 DLQ 재처리
+# ══════════════════════════════════════════════════════════════════
+
+_INTERNAL_API_SECRET = os.getenv("INTERNAL_API_SECRET", "")
+
+
+@app.post("/internal/dlq-recovery", tags=["내부"], include_in_schema=False)
+async def trigger_dlq_recovery(request: Request):
+    """
+    Cloud Scheduler 전용 DLQ 재처리 트리거.
+    Swagger UI 미노출 (include_in_schema=False).
+    Authorization: Bearer {INTERNAL_API_SECRET} 헤더 검증.
+    """
+    # INTERNAL_API_SECRET 설정된 경우 Bearer 토큰 검증 (설정 안 된 경우 로컬 개발로 허용)
+    if _INTERNAL_API_SECRET:
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer ") or \
+                auth_header[len("Bearer "):].strip() != _INTERNAL_API_SECRET:
+            raise HTTPException(status_code=401, detail="내부 API 인증 실패")
+
+    from dlq_recovery_worker import run_recovery
+    import asyncio as _asyncio
+    _asyncio.create_task(run_recovery())
+    return {"accepted": True, "message": "DLQ 재처리 시작"}
 
 
 class ResolutionBody(BaseModel):
@@ -1757,6 +1786,7 @@ async def _fire_notion_pipeline(
             care_record_id=care_record_id,
             raw_voice_text=raw_voice_text,
             recorded_at=recorded_at,
+            redis_url=REDIS_URL,
         )
         logger.info(
             f"[{label}] ✅ Notion 파이프라인 완료: "

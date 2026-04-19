@@ -49,6 +49,10 @@ _REQUIRED: dict = {
         "ADMIN_PHONE",
         "DEFAULT_FACILITY_PHONE",
     ],
+    "app_check": [
+        "FIREBASE_PROJECT_ID",
+        "FIREBASE_SERVICE_ACCOUNT_JSON",
+    ],
 }
 
 # ── 금지된 기본값 (운영값으로 교체되지 않은 placeholder) ──────────

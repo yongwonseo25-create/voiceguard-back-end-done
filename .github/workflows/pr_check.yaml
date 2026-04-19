@@ -1,0 +1,35 @@
+name: PR Security Gate
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  security:
+    name: "보안 스캔 — Bandit + Safety CVE"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 보안 스캔 도구 설치
+        run: pip install "bandit[toml]>=1.7.0" "safety>=3.0.0"
+
+      - name: Bandit 정적 보안 스캔 (HIGH 발견 시 PR 차단)
+        run: |
+          bandit -r backend/ \
+            -ll \
+            --severity-level high \
+            --exclude backend/test_*.py
+
+      - name: Safety 의존성 CVE 체크
+        run: |
+          safety check \
+            --file backend/requirements-api.txt \
+            --full-report

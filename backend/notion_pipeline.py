@@ -30,10 +30,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import time
 from typing import Optional
 
 import httpx
+import redis.asyncio as aioredis
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -68,9 +68,9 @@ _BACKOFF_BASE    = 2.0      # 지수 백오프 베이스 (초)
 _MAX_BACKOFF     = 60.0     # 최대 단일 대기 상한 (초)
 _DEFAULT_TIMEOUT = 15.0     # Notion API 타임아웃
 
-# Page ID 캐시 (In-Memory, Hot Path 지연 최소화)
-_page_id_cache: dict[str, tuple[str, float]] = {}  # key → (page_id, expire_ts)
-_CACHE_TTL_SEC  = 3600.0    # 1시간 캐시 TTL
+# Redis 공유 캐시 (UPGRADE-04: In-Memory dict 완전 제거)
+_CACHE_TTL_SEC      = 3600                  # Redis setex TTL (초)
+_REDIS_CACHE_PREFIX = "vg:notion_cache:"    # 키 충돌 방지 전용 프리픽스
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -257,38 +257,52 @@ async def _api_request_with_retry(
 # SECTION 3: Page ID 조회 캐시 (제3원칙 관계형 ID 매핑)
 # ══════════════════════════════════════════════════════════════════
 
-def _cache_get(key: str) -> Optional[str]:
-    entry = _page_id_cache.get(key)
-    if entry and time.monotonic() < entry[1]:
-        return entry[0]
-    return None
+async def _cache_get(key: str, redis_client: Optional[aioredis.Redis]) -> Optional[str]:
+    """Redis TTL 캐시 조회 — MISS 또는 장애 시 None 반환 (예외 전파 금지)."""
+    if not redis_client:
+        return None
+    try:
+        val = await redis_client.get(f"{_REDIS_CACHE_PREFIX}{key}")
+        return val if val else None
+    except Exception as exc:
+        logger.warning(f"[CACHE] Redis 조회 실패 (캐시 MISS로 처리): {exc}")
+        return None
 
 
-def _cache_set(key: str, page_id: str) -> None:
-    _page_id_cache[key] = (page_id, time.monotonic() + _CACHE_TTL_SEC)
+async def _cache_set(key: str, page_id: str, redis_client: Optional[aioredis.Redis]) -> None:
+    """Redis TTL 캐시 저장 — 실패는 경고만 (파이프라인 블로킹 금지)."""
+    if not redis_client:
+        return
+    try:
+        await redis_client.setex(f"{_REDIS_CACHE_PREFIX}{key}", _CACHE_TTL_SEC, page_id)
+    except Exception as exc:
+        logger.warning(f"[CACHE] Redis 저장 실패 (무시): {exc}")
 
 
 async def lookup_page_id(
-    client:    httpx.AsyncClient,
-    db_id:     str,
-    prop_name: str,
-    prop_val:  str,
+    client:       httpx.AsyncClient,
+    db_id:        str,
+    prop_name:    str,
+    prop_val:     str,
+    redis_client: Optional[aioredis.Redis] = None,
 ) -> Optional[str]:
     """
     Notion 마스터 DB를 조회하여 내부 ID에 해당하는 Page ID 반환.
-    캐시 HIT 시 API 호출 없음 (Hot Path 지연 0 추가).
+    Redis 캐시 HIT 시 API 호출 없음. Redis 장애 시 Notion API로 폴백.
 
     Args:
-        db_id:     조회 대상 Notion DB ID (RESIDENT_DB_ID or CAREGIVER_DB_ID)
-        prop_name: 매칭 속성명 (e.g. "수급자 ID", "보호사 ID")
-        prop_val:  매칭 속성값 (e.g. beneficiary_id, caregiver_id)
+        db_id:        조회 대상 Notion DB ID (RESIDENT_DB_ID or CAREGIVER_DB_ID)
+        prop_name:    매칭 속성명 (e.g. "수급자 ID", "보호사 ID")
+        prop_val:     매칭 속성값 (e.g. beneficiary_id, caregiver_id)
+        redis_client: 공유 Redis 클라이언트 (없으면 API 직접 호출)
 
     Returns:
         Notion Page ID (UUID 형식) 또는 None (미발견 / API 오류)
     """
     cache_key = f"{db_id}::{prop_name}::{prop_val}"
-    cached = _cache_get(cache_key)
+    cached = await _cache_get(cache_key, redis_client)
     if cached:
+        logger.debug(f"[CACHE] HIT — val={prop_val!r}")
         return cached
 
     url  = f"{NOTION_BASE_URL}/databases/{db_id}/query"
@@ -312,18 +326,19 @@ async def lookup_page_id(
 
     page_id = results[0].get("id", "")
     if page_id:
-        _cache_set(cache_key, page_id)
+        await _cache_set(cache_key, page_id, redis_client)
         logger.info(f"[LOOKUP] 캐시 저장 — val={prop_val!r} → page_id={page_id[:8]}…")
     return page_id or None
 
 
 async def lookup_staff(
-    client:      httpx.AsyncClient,
+    client:       httpx.AsyncClient,
     caregiver_id: str,
+    redis_client: Optional[aioredis.Redis] = None,
 ) -> tuple[Optional[str], list[str]]:
     """
     VG_직원_DB에서 caregiver_id(이름)로 직원 페이지를 찾아
-    (page_id, [user_ids]) 튜플 반환.
+    (page_id, [user_ids]) 튜플 반환. Redis 캐시 적용.
 
     - Relation 매핑용: page_id → "VG_보호사직원_DB" 속성
     - Person 알림용:   user_ids → "알림용 담당자" 속성
@@ -331,6 +346,14 @@ async def lookup_staff(
     """
     if not STAFF_DB_ID or not caregiver_id:
         return None, []
+
+    # Redis 캐시: page_id 조회 (user_ids는 변동 가능성으로 비캐시)
+    cache_key = f"staff::{STAFF_DB_ID}::{caregiver_id}"
+    cached_page_id = await _cache_get(cache_key, redis_client)
+    if cached_page_id:
+        logger.debug(f"[CACHE] HIT staff — caregiver_id={caregiver_id!r}")
+        # user_ids는 캐시 없이 항상 최신 조회
+        # (알림 누락 방지 — 사람 속성은 자주 변경될 수 있음)
 
     url  = f"{NOTION_BASE_URL}/databases/{STAFF_DB_ID}/query"
     body = {
@@ -360,6 +383,7 @@ async def lookup_staff(
     user_ids    = [p["id"] for p in people_list if p.get("id")]
 
     if page_id:
+        await _cache_set(cache_key, page_id, redis_client)
         logger.info(
             f"[STAFF-LOOKUP] 직원 발견 caregiver_id={caregiver_id!r} "
             f"page_id={page_id[:8]}… users={len(user_ids)}"
@@ -697,14 +721,16 @@ async def run_pipeline(
     care_record_id:   str,
     raw_voice_text:   str = "",
     recorded_at:      Optional[str] = None,
+    redis_url:        Optional[str] = None,
 ) -> dict:
     """
     Voice Guard Notion 파이프라인 통합 진입점.
 
     1. Pydantic 검증 (입력 방어막)
-    2. Resident / Caregiver Page ID 조회 (마스터 DB Relation 매핑)
-    3. Hot Path: VG_운영_대시보드_DB 1행 생성
-    4. Cold Path: 원자 이벤트 분해 → 비동기 큐 적재
+    2. Redis 공유 캐시 초기화 (redis_url 제공 시, 장애 시 None으로 폴백)
+    3. Resident / Caregiver / Staff Page ID 조회 (Redis 캐시 우선)
+    4. Hot Path: VG_운영_대시보드_DB 1행 생성
+    5. Cold Path: 원자 이벤트 분해 → 비동기 큐 적재
 
     Args:
         gemini_care_json: call_gemini_care_record() 반환 dict
@@ -714,6 +740,7 @@ async def run_pipeline(
         care_record_id:   PostgreSQL UUID
         raw_voice_text:   원본 발화 텍스트
         recorded_at:      ISO-8601 타임스탬프 (없으면 현재 시각)
+        redis_url:        Redis 연결 URL (없으면 캐시 없이 Notion API 직접 호출)
 
     Returns:
         {
@@ -747,15 +774,25 @@ async def run_pipeline(
         result["hot_path"]["error"] = f"VALIDATION_ERROR: {exc}"
         return result
 
+    # ── Step 2: Redis 공유 캐시 초기화 (장애 시 None으로 폴백) ──
+    redis_client: Optional[aioredis.Redis] = None
+    if redis_url:
+        try:
+            redis_client = aioredis.from_url(redis_url, decode_responses=True)
+            await redis_client.ping()
+        except Exception as exc:
+            logger.warning(f"[PIPELINE] Redis 연결 실패 (캐시 없이 진행): {exc}")
+            redis_client = None
+
     async with httpx.AsyncClient() as client:
-        # ── Step 2: Relation Page ID 조회 (병렬, 캐시 우선) ──────
+        # ── Step 3: Relation Page ID 조회 (병렬, Redis 캐시 우선) ──
         (resident_page_id, caregiver_page_id), (staff_page_id, staff_user_ids) = \
             await asyncio.gather(
                 asyncio.gather(
-                    lookup_page_id(client, RESIDENT_DB_ID,  RESIDENT_LOOKUP_PROP,  beneficiary_id),
-                    lookup_page_id(client, CAREGIVER_DB_ID, CAREGIVER_LOOKUP_PROP, caregiver_id),
+                    lookup_page_id(client, RESIDENT_DB_ID,  RESIDENT_LOOKUP_PROP,  beneficiary_id, redis_client),
+                    lookup_page_id(client, CAREGIVER_DB_ID, CAREGIVER_LOOKUP_PROP, caregiver_id,   redis_client),
                 ),
-                lookup_staff(client, caregiver_id),
+                lookup_staff(client, caregiver_id, redis_client),
             )
 
         # ── Step 3: Hot Path (1행 생성) ──────────────────────────
@@ -795,6 +832,9 @@ async def run_pipeline(
             logger.info(
                 "[PIPELINE] NOTION_ATOMIC_EVENTS_DB_ID 미설정 — Cold Path 건너뜀"
             )
+
+    if redis_client:
+        await redis_client.aclose()
 
     logger.info(
         f"[PIPELINE] 완료 — hot={result['hot_path']['success']} "
