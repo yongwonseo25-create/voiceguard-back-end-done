@@ -14,7 +14,7 @@ type Screen = 'HOME' | 'RECORDING' | 'REVIEW' | 'COMPLETING';
 export default function App() {
   const [screen, setScreen] = useState<Screen>('HOME');
   const [homeView, setHomeView] = useState<'MAIN' | 'LOG_SUB' | 'KAKAO_SUB'>('MAIN');
-  const [mode, setMode] = useState<'LOG' | 'KAKAO' | null>(null);
+  const [mode, setMode] = useState<'LOG' | 'KAKAO' | 'HANDOVER' | null>(null);
   const [recordedText, setRecordedText] = useState('');
   const [progress, setProgress] = useState(0);
   const [seconds, setSeconds] = useState(0);
@@ -85,7 +85,7 @@ export default function App() {
     }
   }, [screen]);
 
-  const startRecording = (m: 'LOG' | 'KAKAO') => {
+  const startRecording = (m: 'LOG' | 'KAKAO' | 'HANDOVER') => {
     setMode(m);
     setScreen('RECORDING');
     setError(null);
@@ -113,7 +113,11 @@ export default function App() {
     setScreen('COMPLETING');
     try {
       if (mode === 'LOG') {
+        // 업무 기록: WORM + Notion 듀얼 Fork
         await apiService.saveLog(recordedText);
+      } else if (mode === 'HANDOVER') {
+        // 인수인계: WORM + Notion 듀얼 Fork (별도 엔드포인트)
+        await apiService.saveHandover(recordedText);
       } else {
         await apiService.sendKakao(recordedText);
       }
@@ -219,16 +223,19 @@ export default function App() {
                   <button onClick={() => setHomeView('MAIN')} className="absolute left-2 p-3 bg-[#FFFFFF] rounded-full shadow-sm active:scale-95 transition-all z-10">
                     <ChevronLeft className="w-6 h-6 text-stone-600" />
                   </button>
-                  <div className="inline-flex items-center gap-3 bg-white/90 shadow-md rounded-full px-6 py-3">
+                  <button
+                    onClick={() => startRecording('LOG')}
+                    className="inline-flex items-center gap-3 bg-white/90 shadow-md rounded-full px-6 py-3 cursor-pointer active:scale-95 transition-all duration-150 z-10 relative"
+                  >
                     <div className="w-3 h-3 rounded-full bg-[#FF5A00] animate-pulse" />
                     <span className="text-xl font-medium text-[#111111]">
                       업무 기록
                     </span>
-                  </div>
+                  </button>
                 </div>
 
                 <button
-                  onClick={() => startRecording('LOG')}
+                  onClick={() => startRecording('HANDOVER')}
                   className="group relative w-full p-6 rounded-3xl active:scale-[0.98] transition-all duration-300 flex items-center gap-5 bg-[#FFFFFF] shadow-[0_8px_30px_rgb(0,0,0,0.06)]"
                 >
                   <div className="w-14 h-14 rounded-full bg-gradient-to-br from-blue-100 to-blue-200 flex items-center justify-center text-2xl shadow-sm border border-white/50">
@@ -241,7 +248,7 @@ export default function App() {
                 </button>
 
                 <button
-                  onClick={handleDoubleTap(() => startRecording('LOG'))}
+                  onClick={handleDoubleTap(() => startRecording('HANDOVER'))}
                   className="group relative w-full p-6 rounded-3xl active:scale-[0.98] transition-all duration-300 flex items-center gap-5 bg-[#FFFFFF] shadow-[0_8px_30px_rgb(0,0,0,0.06)]"
                 >
                   <div className="w-14 h-14 rounded-full bg-gradient-to-br from-orange-100 to-orange-200 flex items-center justify-center text-2xl shadow-sm border border-white/50">
@@ -254,7 +261,7 @@ export default function App() {
                 </button>
 
                 <button
-                  onClick={handleDoubleTap(() => startRecording('LOG'))}
+                  onClick={handleDoubleTap(() => startRecording('HANDOVER'))}
                   className="group relative w-full p-6 rounded-3xl active:scale-[0.98] transition-all duration-300 flex items-center gap-5 bg-[#FFFFFF] shadow-[0_8px_30px_rgb(0,0,0,0.06)]"
                 >
                   <div className="w-14 h-14 rounded-full bg-gradient-to-br from-green-100 to-green-200 flex items-center justify-center text-2xl shadow-sm border border-white/50">

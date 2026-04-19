@@ -444,13 +444,13 @@ async def create_ops_dashboard_row(
         "식사":     {"checkbox": record.meal.done},
         "투약":     {"checkbox": record.medication.done},
         "배설":     {"checkbox": record.excretion.done},
-        "체위변경": {"checkbox": record.repositioning.done},
+        "체위 변경": {"checkbox": record.repositioning.done},
         "위생":     {"checkbox": record.hygiene.done},
         # ── 텍스트 필드 (G-04 해소) ───────────────────────────────
         "정제발화": {
             "rich_text": [{"type": "text", "text": {"content": corrected}}]
         },
-        "특이사항": {
+        "특이사항 ": {
             "rich_text": [{"type": "text", "text": {"content": special_text}}]
         },
     }
