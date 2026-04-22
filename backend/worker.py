@@ -9,6 +9,10 @@ Redis Streams 무결점 비동기 워커 v2.0
   D. DLQ 이관     → attempts ≥ 5 → dead_letter_queue
   E. 중복 제출    → Idempotency (Ingest 계층 차단)
   F. DB 실패      → engine.begin() 자동 롤백
+
+[Phase 10: 증거 검증서 자동 발급]
+  G. 봉인 직후 PDF + JSON 검증서 병렬 생성 → B2 WORM 적재 → certificate_ledger INSERT
+     PDF/JSON 렌더링 실패 시 evidence_seal_event INSERT가 차단됨 (원자성 보장)
 """
 
 import asyncio
@@ -19,6 +23,7 @@ import json
 import logging
 import os
 import time
+import uuid as _uuid_mod
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
@@ -36,6 +41,7 @@ from notifier import (
 )
 from gemini_processor import call_gemini, call_gemini_care_record
 from env_guard import check_env_vars
+from cert_renderer import render_pdf_certificate, render_json_certificate
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO,
@@ -71,6 +77,7 @@ engine = create_engine(DATABASE_URL, pool_size=5, max_overflow=10,
 
 _whisper_model = None
 _whisper_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="whisper")
+_cert_pool    = ThreadPoolExecutor(max_workers=2, thread_name_prefix="cert")
 
 def get_whisper():
     global _whisper_model
@@ -103,6 +110,45 @@ def build_chain(ledger_id, facility_id, beneficiary_id, shift_id,
         "transcript_sha256": transcript_sha256, "b2_key": b2_key}, sort_keys=True)
     raw = hashlib.sha256(payload.encode()).hexdigest()
     return hm.new(SERVER_SECRET, raw.encode(), hashlib.sha256).hexdigest()
+
+# ── 증거 검증서 병렬 발급 (Phase 10) ─────────────────────────────
+async def _issue_certificates(seal_data: dict, b2_client, ledger_id: str,
+                               retain: datetime) -> tuple[str, str, bytes, bytes]:
+    """
+    PDF + JSON 검증서를 _cert_pool에서 병렬 렌더링 후 B2 WORM 업로드.
+    반환: (pdf_key, json_key, pdf_bytes, json_bytes)
+
+    [원자성 보장]
+    이 함수가 예외를 raise하면 caller의 try 블록 전체가 except로 빠진다.
+    evidence_seal_event INSERT는 이 함수 호출 이후에 위치하므로
+    이 함수 실패 = DB 트랜잭션 미개방 = 봉인 ROLLBACK 완전 보장.
+    """
+    loop = asyncio.get_event_loop()
+
+    # asyncio.gather: PDF/JSON 병렬 렌더링 — 어느 하나 예외 시 전체 전파
+    pdf_bytes, json_bytes = await asyncio.gather(
+        loop.run_in_executor(_cert_pool, render_pdf_certificate, seal_data),
+        loop.run_in_executor(_cert_pool, render_json_certificate, seal_data),
+    )
+
+    # B2 WORM 업로드 (두 파일 모두 COMPLIANCE)
+    pdf_key  = f"certs/pdf/{datetime.now(timezone.utc).strftime('%Y/%m/%d')}/{ledger_id}.pdf"
+    json_key = f"certs/json/{datetime.now(timezone.utc).strftime('%Y/%m/%d')}/{ledger_id}.json"
+
+    b2_client.put_object(
+        Bucket=B2_BUCKET_NAME, Key=pdf_key, Body=pdf_bytes,
+        ContentType="application/pdf",
+        ObjectLockMode="COMPLIANCE", ObjectLockRetainUntilDate=retain,
+    )
+    b2_client.put_object(
+        Bucket=B2_BUCKET_NAME, Key=json_key, Body=json_bytes,
+        ContentType="application/json",
+        ObjectLockMode="COMPLIANCE", ObjectLockRetainUntilDate=retain,
+    )
+
+    logger.info(f"[CERT] 검증서 B2 업로드 완료: pdf={pdf_key} json={json_key}")
+    return pdf_key, json_key, pdf_bytes, json_bytes
+
 
 # ── DLQ 이관 ─────────────────────────────────────────────────────
 def send_to_dlq(ledger_id: str, outbox_id: str, reason: str, payload: str):
@@ -227,6 +273,33 @@ async def process(redis: aioredis.Redis, ledger_id: str, msg_id: str):
             meta.get("beneficiary_id",""), meta.get("shift_id",""),
             meta.get("server_ts",""), audio_sha256, transcript_sha256, b2_key)
 
+        # ── [Phase 10] 검증서 병렬 렌더링 + B2 업로드 ───────────────
+        # 반드시 DB 트랜잭션 진입 전에 실행.
+        # 실패 시 예외가 외부 except로 전파 → DB INSERT 미실행 = 원자성 보장.
+
+        # [Bug 1+2 Fix] seal_event_id를 ledger_id 기반 uuid5로 결정론적 생성.
+        # uuid5는 동일 ledger_id에 대해 항상 동일 UUID → 재시도 시 cert 내용 불변 보장.
+        # cert_hash 발산 없음, B2 동일 키에 동일 바이트 PUT → 완전 멱등.
+        seal_event_id = str(_uuid_mod.uuid5(_uuid_mod.NAMESPACE_URL, ledger_id))
+        seal_data_for_cert = {
+            "ledger_id":        ledger_id,
+            "seal_event_id":    seal_event_id,
+            "facility_id":      meta.get("facility_id",   ""),
+            "beneficiary_id":   meta.get("beneficiary_id",""),
+            "care_type":        meta.get("care_type",     ""),
+            "ingested_at":      meta.get("server_ts",     ""),
+            "audio_sha256":     audio_sha256,
+            "transcript_sha256":transcript_sha256,
+            "chain_hash":       chain,
+            "transcript_text":  transcript,
+            "worm_bucket":      B2_BUCKET_NAME,
+            "worm_object_key":  b2_key,
+            "worm_retain_until":retain.isoformat(),
+        }
+        pdf_key_cert, json_key_cert, pdf_bytes, json_bytes = await _issue_certificates(
+            seal_data_for_cert, b2, ledger_id, retain
+        )
+
         # ── [TD-02] Append-Only 봉인: evidence_ledger UPDATE 폐지 ──
         # 봉인 결과는 evidence_seal_event에 INSERT (Append-Only).
         # ON CONFLICT (ledger_id) DO NOTHING — 워커 재시도 시 멱등 보장.
@@ -239,22 +312,51 @@ async def process(redis: aioredis.Redis, ledger_id: str, msg_id: str):
                     worm_bucket, worm_object_key, worm_retain_until,
                     sealed_at
                 ) VALUES (
-                    gen_random_uuid(), :lid, :a, :t,
+                    :seid, :lid, :a, :t,
                     :c, :tx,
                     :bkt, :bk, :ret,
                     NOW()
                 )
                 ON CONFLICT (ledger_id) DO NOTHING
             """), {
-                "lid": ledger_id,
-                "a":   audio_sha256,
-                "t":   transcript_sha256,
-                "c":   chain,
-                "tx":  transcript,
-                "bkt": B2_BUCKET_NAME,
-                "bk":  b2_key,
-                "ret": retain,
+                "seid": seal_event_id,
+                "lid":  ledger_id,
+                "a":    audio_sha256,
+                "t":    transcript_sha256,
+                "c":    chain,
+                "tx":   transcript,
+                "bkt":  B2_BUCKET_NAME,
+                "bk":   b2_key,
+                "ret":  retain,
             })
+
+            # ── [Phase 10] certificate_ledger INSERT (동일 트랜잭션) ──
+            # RETURNING으로 seal_event_id를 받을 수 없을 때는 SELECT로 조회
+            seal_row = conn.execute(text(
+                "SELECT id FROM evidence_seal_event WHERE ledger_id=:lid"
+            ), {"lid": ledger_id}).fetchone()
+            seal_event_id = str(seal_row.id) if seal_row else ledger_id
+
+            conn.execute(text("""
+                INSERT INTO certificate_ledger
+                    (id, ledger_id, seal_event_id, cert_type,
+                     cert_hash, storage_key, issuer_version, worm_retain_until)
+                VALUES
+                    (gen_random_uuid(), :lid, :seid, 'PDF',
+                     :phash, :pkey, 'vg-cert-v1.0.0', :ret),
+                    (gen_random_uuid(), :lid, :seid, 'JSON',
+                     :jhash, :jkey, 'vg-cert-v1.0.0', :ret)
+                ON CONFLICT (seal_event_id, cert_type) DO NOTHING
+            """), {
+                "lid":   ledger_id,
+                "seid":  seal_event_id,
+                "phash": hashlib.sha256(pdf_bytes).hexdigest(),
+                "pkey":  pdf_key_cert,
+                "jhash": hashlib.sha256(json_bytes).hexdigest(),
+                "jkey":  json_key_cert,
+                "ret":   retain,
+            })
+
             conn.execute(text(
                 "UPDATE outbox_events SET status='done',processed_at=NOW() WHERE id=:id"),
                 {"id": outbox_id})

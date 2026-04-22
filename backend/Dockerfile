@@ -6,9 +6,11 @@
 
 FROM python:3.12-slim
 
-# 시스템 의존성 (psycopg2-binary 는 libpq 불필요, binary wheel 사용)
+# 시스템 의존성 (psycopg2-binary는 libpq 불필요, binary wheel 사용)
+# fonts-nanum: fpdf2 한국어 PDF 렌더링용 NanumGothic TTF (Phase 10)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    fonts-nanum \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -1,0 +1,29 @@
+repos:
+  - repo: local
+    hooks:
+      # ── 훅 1: JSON 스키마 검증 (cert_renderer.py 수정 시 자동 실행) ──
+      - id: validate-cert-json-schema
+        name: "VG Certificate JSON Schema Validator"
+        entry: python backend/validate_cert_schema.py
+        language: python
+        files: ^backend/cert_renderer\.py$
+        types: [python]
+        additional_dependencies:
+          - "fpdf2>=2.7.9"
+          - "jsonschema>=4.21.0"
+
+      # ── 훅 2: Bandit 보안 스캔 (cert_renderer.py 수정 시 자동 실행) ──
+      - id: bandit-cert-module
+        name: "Bandit Security Scan — cert_renderer"
+        entry: bandit -r backend/cert_renderer.py -c backend/.bandit -ll
+        language: system
+        files: ^backend/cert_renderer\.py$
+        pass_filenames: false
+
+      # ── 훅 3: Bandit 전체 백엔드 스캔 (모든 .py 커밋 시) ──────────
+      - id: bandit-backend-full
+        name: "Bandit Security Scan — backend full"
+        entry: bandit -r backend/ -c backend/.bandit -ll --exclude backend/test_
+        language: system
+        files: ^backend/.*\.py$
+        pass_filenames: false
