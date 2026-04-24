@@ -35,8 +35,9 @@ from app_check_middleware import app_check_middleware
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
+import httpx
 import openai
-import google.generativeai as genai
+import re
 
 from notifier import (
     send_alimtalk,
@@ -56,6 +57,7 @@ from angel_export import router as angel_export_router, init_angel_export
 from angel_rpa import router as angel_rpa_router, init_angel_rpa
 from env_guard import check_env_vars
 from notion_pipeline import run_pipeline as notion_run_pipeline
+from notion_pipeline import create_handover_row as notion_create_handover_row
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,10 +83,33 @@ ALLOWED_ORIGINS = [o.strip() for o in os.getenv(
 # ── AI API 설정 (사령관 지시) ──────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
+
+GEMINI_REST_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.5-flash:generateContent"
+)
+
+async def _call_gemini(prompt: str) -> str:
+    """Gemini REST API — x-goog-api-key 헤더 인증 (키 로그 노출 차단) + 지수 백오프 재시도"""
+    headers = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    last_exc: Exception = RuntimeError("Gemini unreachable")
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(GEMINI_REST_URL, headers=headers, json=payload)
+                resp.raise_for_status()
+                return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+            last_exc = exc
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+    raise last_exc
 
 # ── DB 엔진 (동기, connection pool) ───────────────────────────────
 engine = create_engine(
@@ -146,54 +171,100 @@ app.include_router(angel_rpa_router)
 # [AI 연동 긴급 실전 테스트] POST /api/v8/test-ai-pipeline
 # ══════════════════════════════════════════════════════════════════
 
+_MOCK_STT_TRANSCRIPT = (
+    "박영옥 수급자, 오전 식사 80% 완료. 투약(혈압약) 모두 복용. "
+    "배설 1회(양호). 체위 변경 2회 실시. 특이사항 없음. 야간 인수인계 합니다."
+)
+
+
 @app.post("/api/v8/test-ai-pipeline", tags=["AI 테스트"])
-async def test_ai_pipeline(audio_file: UploadFile = File(...)):
+async def test_ai_pipeline(
+    audio_file: UploadFile = File(...),
+    x_mock_stt: Optional[str] = Header(None),
+):
     """
-    [실전 연동 완료] Whisper STT -> Gemini 2.5 Flash 전체 파이프라인
-    음성을 텍스트로 변환(Whisper) 후, gemini-2.5-flash 모델로 분석합니다.
+    Whisper STT → Gemini 2.5 Flash 기본 정제 파이프라인.
+    X-Mock-Stt: true 헤더 시 Whisper를 우회하고 캐드 트랜스크립트 사용 (시연 모드).
     """
-    if not OPENAI_API_KEY or not GEMINI_API_KEY:
-        raise HTTPException(500, "서버 설정(OPENAI_API_KEY 또는 GEMINI_API_KEY)이 누락되었습니다.")
+    if not GEMINI_API_KEY:
+        raise HTTPException(500, "GEMINI_API_KEY 누락")
 
-    tmp_path = Path(tempfile.gettempdir()) / f"test_{uuid4()}.wav"
-    try:
-        content = await audio_file.read()
-        tmp_path.write_bytes(content)
+    mock_stt = (x_mock_stt or "").strip().lower() == "true"
 
-        # 1. Whisper 음성 변환
-        logger.info("[AI-PIPELINE] OpenAI Whisper 변환 시작...")
-        client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
-        with open(tmp_path, "rb") as f:
-            transcript = await client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                language="ko"
+    # ── 1. Whisper STT ────────────────────────────────────────────
+    if mock_stt:
+        text_result = _MOCK_STT_TRANSCRIPT
+        logger.info(
+            f"[AI-PIPELINE] ✅ 위스퍼 STT 변환 성공 (Mock 모드) "
+            f"— transcript: {text_result[:80]}..."
+        )
+    else:
+        if not OPENAI_API_KEY:
+            raise HTTPException(500, "OPENAI_API_KEY 누락")
+        tmp_path = Path(tempfile.gettempdir()) / f"test_{uuid4()}.wav"
+        try:
+            content = await audio_file.read()
+            tmp_path.write_bytes(content)
+            logger.info("[AI-PIPELINE] OpenAI Whisper 변환 시작...")
+            client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+            with open(tmp_path, "rb") as f:
+                transcript = await client.audio.transcriptions.create(
+                    model="whisper-1", file=f, language="ko"
+                )
+            text_result = transcript.text
+            logger.info(
+                f"[AI-PIPELINE] ✅ 위스퍼 STT 변환 성공 "
+                f"— transcript: {text_result[:80]}..."
             )
-        text_result = transcript.text
-        logger.info(f"[AI-PIPELINE] Whisper 텍스트: {text_result}")
+        except Exception as e:
+            logger.error(f"[AI-PIPELINE] Whisper 오류: {e}")
+            raise HTTPException(500, f"Whisper STT 실패: {e}")
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
 
-        # 2. Gemini 2.5 Flash 텍스트 분석
-        logger.info("[AI-PIPELINE] Gemini 2.5 Flash 분석 시작...")
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        prompt = f"당신은 요양보호사의 음성 인수인계를 듣고 분석하는 AI입니다. 다음 기록에서 수급자 관련 주요 이슈, 행위(배변, 식사 등), 특이사항을 매우 간결히 요약해주세요:\n\n[발화 내용]\n{text_result}"
-        
-        response = model.generate_content(prompt)
-        logger.info("[AI-PIPELINE] Gemini 2.5 Flash 분석 완료")
-
-        return {
-            "success": True,
-            "whisper_transcript": text_result,
-            "gemini_analysis": response.text,
-        }
+    # ── 2. Gemini 구조화 JSON 정제 ───────────────────────────────────────
+    gemini_structured: dict = {}
+    try:
+        logger.info("[AI-PIPELINE] Gemini 2.5 Flash 구조화 정제 시작...")
+        prompt = (
+            "당신은 요양보호사의 음성 인수인계를 분석하는 요양 전문 AI입니다.\n"
+            "아래 발화 내용을 분석하여 반드시 다음 JSON 형식 그대로만 응답하십시오.\n"
+            "다른 설명, 마크다운 코드블록, 추가 텍스트 없이 JSON만 출력하십시오.\n\n"
+            "{\n"
+            '  "full_refined": "발화 전체를 문어체로 완전히 정제한 인수인계 보고문 (150자 이내)",\n'
+            '  "summary": "핵심 케어 행위 요약 — 식사/투약/배설/체위변경/특이사항 중심 (80자 이내)",\n'
+            '  "urgent_note": "즉시 조치 필요 사항 또는 이상 징후. 없으면 빈 문자열"\n'
+            "}\n\n"
+            f"[발화 내용]\n{text_result}"
+        )
+        raw = await _call_gemini(prompt)
+        # 마크다운 코드블록 제거 방어 (```json ... ``` 또는 ``` ... ```)
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+        gemini_structured = json.loads(raw)
+        logger.info(
+            f"[AI-PIPELINE] ✅ 제미나이 정제 성공 "
+            f"— summary: {gemini_structured.get('summary','')[:60]}..."
+        )
     except Exception as e:
-        logger.error(f"[AI-PIPELINE] 오류 발생: {e}")
-        raise HTTPException(500, str(e))
-    finally:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except:
-                pass
+        logger.error(f"[AI-PIPELINE] Gemini 오류 또는 JSON 파싱 실패: {e}")
+        gemini_structured = {
+            "full_refined": text_result,
+            "summary":      text_result[:80],
+            "urgent_note":  "",
+        }
+
+    return {
+        "success":            True,
+        "whisper_transcript": text_result,
+        "gemini_analysis":    gemini_structured.get("full_refined", text_result),
+        "gemini_summary":     gemini_structured.get("summary", ""),
+        "gemini_urgent_note": gemini_structured.get("urgent_note", ""),
+        "gemini_structured":  gemini_structured,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1798,6 +1869,50 @@ async def _fire_notion_pipeline(
         logger.error(f"[{label}] ❌ Notion 파이프라인 실패 (DB 커밋은 유지): {exc}")
 
 
+async def _fire_handover_pipeline(
+    care_record_id: str,
+    full_refined:   str,
+    summary:        str,
+    urgent_note:    str,
+    beneficiary_id: str,
+    caregiver_id:   str,
+    recorded_at:    Optional[str],
+) -> None:
+    """
+    인수인계 DB 전용 Notion 행 생성 (fire-and-forget).
+    create_handover_row() → NOTION_HANDOVER_DB_ID (34cdbdd0...) 직접 적재.
+    """
+    import httpx as _httpx
+    from notion_pipeline import lookup_page_id, RESIDENT_DB_ID, CAREGIVER_DB_ID
+    from notion_pipeline import RESIDENT_LOOKUP_PROP, CAREGIVER_LOOKUP_PROP
+
+    try:
+        async with _httpx.AsyncClient() as client:
+            resident_page_id, caregiver_page_id = await asyncio.gather(
+                lookup_page_id(client, RESIDENT_DB_ID,  RESIDENT_LOOKUP_PROP,  beneficiary_id, None),
+                lookup_page_id(client, CAREGIVER_DB_ID, CAREGIVER_LOOKUP_PROP, caregiver_id,   None),
+            )
+            ok, page_id, err = await notion_create_handover_row(
+                care_record_id=care_record_id,
+                full_refined=full_refined,
+                summary=summary,
+                urgent_note=urgent_note,
+                recorded_at=recorded_at,
+                client=client,
+                resident_page_id=resident_page_id,
+                caregiver_page_id=caregiver_page_id,
+            )
+        if ok:
+            logger.info(
+                f"[HANDOVER-NOTION] ✅ 인수인계 DB 적재 완료: "
+                f"care={care_record_id[:8]}… page={page_id[:8] if page_id else 'None'}…"
+            )
+        else:
+            logger.error(f"[HANDOVER-NOTION] ❌ 인수인계 DB 적재 실패: {err}")
+    except Exception as exc:
+        logger.error(f"[HANDOVER-NOTION] ❌ 파이프라인 예외: {exc}")
+
+
 # ══════════════════════════════════════════════════════════════════
 # [FRONT-BRIDGE v2] POST /api/v8/work-record
 #
@@ -2235,12 +2350,38 @@ async def post_handover(body: HandoverBody):
             logger.warning(f"[HANDOVER] SSE PUBLISH 실패 (WORM 봉인은 유지): {e}")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FORK B — Notion 워크스페이스 (care_record_ledger → 인수인계 DB)
+    # FORK B — Gemini 구조화 JSON 생성 → Notion 인수인계 DB 적재
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # G-03: 제공된 실제 ID 우선, 미제공 시 폴백 (WORM 봉인과 무관)
     fork_b_facility    = (body.facility_id    or "handover").strip() or "handover"
     fork_b_beneficiary = (body.beneficiary_id or "resident_user").strip() or "resident_user"
     fork_b_caregiver   = (body.caregiver_id   or "handover_staff").strip() or "handover_staff"
+
+    # Gemini 구조화 정제: summary / urgent_note / full_refined 분리
+    gemini_fields: dict = {"full_refined": body.text, "summary": body.text[:80], "urgent_note": ""}
+    try:
+        logger.info("[HANDOVER] Gemini 인수인계 구조화 정제 시작...")
+        _prompt = (
+            "당신은 요양보호사의 인수인계 텍스트를 정리하는 요양 전문 AI입니다.\n"
+            "아래 텍스트를 분석하여 반드시 다음 JSON 형식 그대로만 응답하십시오.\n"
+            "다른 설명, 마크다운 코드블록, 추가 텍스트 없이 JSON만 출력하십시오.\n\n"
+            "{\n"
+            '  "full_refined": "전체 인수인계 내용을 문어체로 완전히 정제한 보고문 (200자 이내)",\n'
+            '  "summary": "핵심 케어 행위 요약 — 식사/투약/배설/체위변경 중심 (80자 이내)",\n'
+            '  "urgent_note": "즉시 조치 필요 이상 징후. 없으면 빈 문자열"\n'
+            "}\n\n"
+            f"[인수인계 텍스트]\n{body.text}"
+        )
+        _raw = await _call_gemini(_prompt)
+        # 마크다운 코드블록 제거 방어 (```json ... ``` 또는 ``` ... ```)
+        _raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", _raw.strip())
+        gemini_fields = json.loads(_raw)
+        logger.info(
+            f"[HANDOVER] ✅ Gemini 구조화 정제 완료 — "
+            f"summary={gemini_fields.get('summary','')[:50]}… "
+            f"urgent={gemini_fields.get('urgent_note','')[:30] or '없음'}"
+        )
+    except Exception as _e:
+        logger.warning(f"[HANDOVER] Gemini 구조화 실패 — 원문 폴백: {_e}")
 
     notion_payload = json.dumps({
         "record_id":       record_id,
@@ -2248,6 +2389,9 @@ async def post_handover(body: HandoverBody):
         "beneficiary_id":  fork_b_beneficiary,
         "caregiver_id":    fork_b_caregiver,
         "raw_voice_text":  body.text,
+        "full_refined":    gemini_fields.get("full_refined", body.text),
+        "summary":         gemini_fields.get("summary", ""),
+        "urgent_note":     gemini_fields.get("urgent_note", ""),
         "recorded_at":     recorded_at,
         "server_ts":       server_ts.isoformat(),
         "worm_ledger_ref": ledger_id,
@@ -2289,34 +2433,33 @@ async def post_handover(body: HandoverBody):
             f"[HANDOVER] ✅ FORK-B Notion DB COMMIT: record={record_id}"
         )
     except Exception as e:
-        # Fork B 실패는 경고만 — Fork A(WORM)는 이미 봉인 완료
         logger.error(f"[HANDOVER] Fork B Notion DB 적재 실패 (WORM 봉인은 유지): {e}")
 
-    # Fork B — Notion 파이프라인 fire-and-forget (동적 ID 사용)
-    asyncio.create_task(_fire_notion_pipeline(
-        facility_id=fork_b_facility,
+    # Fork B — 인수인계 DB 전용 Notion 행 생성 (fire-and-forget)
+    asyncio.create_task(_fire_handover_pipeline(
+        care_record_id=record_id,
+        full_refined=gemini_fields.get("full_refined", body.text),
+        summary=gemini_fields.get("summary", ""),
+        urgent_note=gemini_fields.get("urgent_note", ""),
         beneficiary_id=fork_b_beneficiary,
         caregiver_id=fork_b_caregiver,
-        care_record_id=record_id,
-        raw_voice_text=body.text,
         recorded_at=recorded_at,
-        label="HANDOVER-NOTION",
     ))
-    logger.info(
-        "[HANDOVER] 🚀 FORK-B Notion 파이프라인 예약 완료 (fire-and-forget)"
-    )
+    logger.info("[HANDOVER] 🚀 FORK-B 인수인계 DB 파이프라인 예약 완료 (fire-and-forget)")
 
     # ── 202 즉시 반환 (WORM COMMIT 기준) ────────────────────────
     return {
-        "accepted":       True,
-        "ledger_id":      ledger_id,
-        "record_id":      record_id,
-        "worm_sealed":    True,
-        "chain_hash":     chain_hash,
-        "text_sha256":    text_sha256,
-        "notion_queued":  True,
-        "server_ts":      server_ts.isoformat(),
-        "message":        "WORM 봉인 완료 + Notion 인수인계 DB 적재 진행 중.",
+        "accepted":          True,
+        "ledger_id":         ledger_id,
+        "record_id":         record_id,
+        "worm_sealed":       True,
+        "chain_hash":        chain_hash,
+        "text_sha256":       text_sha256,
+        "notion_queued":     True,
+        "gemini_summary":    gemini_fields.get("summary", ""),
+        "gemini_urgent":     gemini_fields.get("urgent_note", ""),
+        "server_ts":         server_ts.isoformat(),
+        "message":           "WORM 봉인 완료 + Notion 인수인계 DB 적재 진행 중.",
     }
 
 
