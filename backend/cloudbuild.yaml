@@ -35,10 +35,10 @@ steps:
   - name: 'python:3.12-slim'
     id: 'cve-check'
     waitFor: ['install-deps']
-    entrypoint: safety
+    entrypoint: bash
     args:
-      - 'check'
-      - '--full-report'
+      - '-c'
+      - 'pip install --no-cache-dir "safety>=3.0.0" && safety check --full-report'
 
   # ── Step 3: 통합 테스트 스위트 (보안 스캔 통과 후에만 실행) ─────
   # security-scan + cve-check 양쪽 통과 시에만 실행 (waitFor 체인)
