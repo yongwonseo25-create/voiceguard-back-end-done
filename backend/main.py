@@ -139,7 +139,19 @@ async def lifespan(app: FastAPI):
     init_angel_export(engine, redis_pub)
     init_angel_rpa(engine, redis_pub)
     logger.info("[STARTUP] 엔젤 브리지 + Export + RPA 초기화 완료.")
+
+    # care_record_outbox 불사조 폴링 워커 기동 (60초 주기 재시도)
+    outbox_poll_task = asyncio.create_task(_care_record_outbox_poll_worker())
+    logger.info("[STARTUP] care_record_outbox 불사조 폴링 워커 기동.")
+
     yield
+
+    outbox_poll_task.cancel()
+    try:
+        await outbox_poll_task
+    except asyncio.CancelledError:
+        logger.info("[SHUTDOWN] care_record_outbox 폴링 워커 정상 종료.")
+
     for r in (redis_pub, redis_sub):
         if r: await r.aclose()
     logger.info("[SHUTDOWN] Redis 연결 종료.")
@@ -165,7 +177,6 @@ app.middleware("http")(app_check_middleware)
 app.include_router(angel_router)
 app.include_router(angel_export_router)
 app.include_router(angel_rpa_router)
-
 
 # ══════════════════════════════════════════════════════════════════
 # [AI 연동 긴급 실전 테스트] POST /api/v8/test-ai-pipeline
@@ -1911,6 +1922,136 @@ async def _fire_handover_pipeline(
             logger.error(f"[HANDOVER-NOTION] ❌ 인수인계 DB 적재 실패: {err}")
     except Exception as exc:
         logger.error(f"[HANDOVER-NOTION] ❌ 파이프라인 예외: {exc}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# care_record_outbox 불사조 폴링 워커
+#
+# 역할: Redis XADD가 실패하거나 워커가 누락된 pending 행을 60초마다
+#       순찰하여 Notion 파이프라인에 재투입. 5회 초과 시 DLQ 격리.
+# ══════════════════════════════════════════════════════════════════
+
+_MAX_OUTBOX_ATTEMPTS = 5
+_POLL_INTERVAL_SECS  = 60
+
+
+async def _outbox_process_one(outbox_id: str, payload: dict) -> None:
+    """
+    care_record_outbox 단건 처리.
+    notion_run_pipeline() 직접 호출 → success 플래그로 done/retry 판단.
+    _fire_notion_pipeline() 우회: 그 함수는 예외를 삼키므로 워커에서 사용 불가.
+    """
+    gemini_care_json: dict = {
+        "meal":          {"done": False},
+        "medication":    {"done": False},
+        "excretion":     {"done": False},
+        "repositioning": {"done": False},
+        "hygiene":       {"done": False},
+        "special_notes": {"done": True, "detail": payload.get("raw_voice_text", "")[:500]},
+    }
+    result = await notion_run_pipeline(
+        gemini_care_json=gemini_care_json,
+        facility_id=payload.get("facility_id",    "unknown"),
+        beneficiary_id=payload.get("beneficiary_id", "unknown"),
+        caregiver_id=payload.get("caregiver_id",  "unknown"),
+        care_record_id=payload.get("record_id",   outbox_id),
+        raw_voice_text=payload.get("raw_voice_text", ""),
+        recorded_at=payload.get("recorded_at"),
+        redis_url=REDIS_URL,
+    )
+    hot_ok  = result.get("hot_path",  {}).get("success", False)
+    cold_ok = result.get("cold_path", {}).get("success", False)
+    if not (hot_ok or cold_ok):
+        raise RuntimeError(
+            f"Notion 파이프라인 실패 — hot={hot_ok} cold={cold_ok} "
+            f"err={result.get('hot_path',{}).get('error') or result.get('cold_path',{}).get('error','unknown')}"
+        )
+
+
+async def _care_record_outbox_poll_worker() -> None:
+    """
+    care_record_outbox 불사조 폴링 워커.
+    기동 즉시 1회 순찰 후 60초 주기로 반복.
+    attempts >= 5 → DLQ 격리 (운영자가 /api/v8/admin/dlq 에서 확인).
+    """
+    logger.info("[OUTBOX-WORKER] 불사조 폴링 워커 기동 완료.")
+
+    async def _poll_once() -> None:
+        if engine is None:
+            return
+
+        # ── 1. pending 행 최대 10건 조회 ──────────────────────────
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT o.id::text AS outbox_id,
+                           o.attempts,
+                           o.payload
+                    FROM care_record_outbox o
+                    WHERE o.status = 'pending'
+                      AND o.attempts < :max_att
+                    ORDER BY o.created_at ASC
+                    LIMIT 10
+                """), {"max_att": _MAX_OUTBOX_ATTEMPTS}).mappings().fetchall()
+        except Exception as exc:
+            logger.error(f"[OUTBOX-WORKER] DB 조회 실패: {exc}")
+            return
+
+        if not rows:
+            logger.debug("[OUTBOX-WORKER] pending 항목 없음 — 다음 순찰 대기.")
+            return
+
+        logger.info(f"[OUTBOX-WORKER] pending {len(rows)}건 Notion 재시도 시작.")
+
+        # ── 2. 각 행 재처리 ───────────────────────────────────────
+        for row in rows:
+            outbox_id = row["outbox_id"]
+            attempts  = row["attempts"]
+            payload   = (
+                row["payload"]
+                if isinstance(row["payload"], dict)
+                else json.loads(row["payload"])
+            )
+
+            try:
+                await _outbox_process_one(outbox_id, payload)
+                with engine.begin() as conn:
+                    # CAST 사용 — ':id::uuid' 구문은 SQLAlchemy 파라미터 파서 충돌
+                    conn.execute(text("""
+                        UPDATE care_record_outbox
+                           SET status = 'done', processed_at = NOW()
+                         WHERE id = CAST(:id AS uuid)
+                    """), {"id": outbox_id})
+                logger.info(
+                    f"[OUTBOX-WORKER] ✅ 처리 완료: outbox={outbox_id[:8]}…"
+                )
+
+            except Exception as exc:
+                new_attempts = attempts + 1
+                new_status   = "dlq" if new_attempts >= _MAX_OUTBOX_ATTEMPTS else "pending"
+                try:
+                    with engine.begin() as conn:
+                        # CAST 사용 — ':id::uuid' 구문은 SQLAlchemy 파라미터 파서 충돌
+                        conn.execute(text("""
+                            UPDATE care_record_outbox
+                               SET attempts = :att, status = :st
+                             WHERE id = CAST(:id AS uuid)
+                        """), {"att": new_attempts, "st": new_status, "id": outbox_id})
+                except Exception as db_exc:
+                    logger.error(
+                        f"[OUTBOX-WORKER] attempts 업데이트 실패: {db_exc}"
+                    )
+                logger.warning(
+                    f"[OUTBOX-WORKER] ⚠️ 실패(시도 {new_attempts}/{_MAX_OUTBOX_ATTEMPTS}): "
+                    f"outbox={outbox_id[:8]}… err={exc}"
+                )
+
+    # 기동 즉시 1회 순찰
+    await _poll_once()
+
+    while True:
+        await asyncio.sleep(_POLL_INTERVAL_SECS)
+        await _poll_once()
 
 
 # ══════════════════════════════════════════════════════════════════

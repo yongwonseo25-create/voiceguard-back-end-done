@@ -57,10 +57,11 @@ CAREGIVER_DB_ID            = os.getenv("CAREGIVER_DB_ID", "ac8dbdd0e3b382f998868
 STAFF_DB_ID                = os.getenv("STAFF_DB_ID",     "347dbdd0e3b3804bb570d4a0317f620e")  # VG_직원_DB
 NOTION_OPS_DASHBOARD_DB_ID = os.getenv("NOTION_OPS_DASHBOARD_DB_ID", "")
 NOTION_ATOMIC_EVENTS_DB_ID = os.getenv("NOTION_ATOMIC_EVENTS_DB_ID", "")
+NOTION_HANDOVER_DB_ID      = os.getenv("NOTION_HANDOVER_DB_ID",      "34cdbdd0e3b380ee9a15ed5f4b411195")
 
 # 마스터 DB 조회 속성명 (실증 확인 값)
 RESIDENT_LOOKUP_PROP  = os.getenv("RESIDENT_LOOKUP_PROP",  "수급자번호")
-CAREGIVER_LOOKUP_PROP = os.getenv("CAREGIVER_LOOKUP_PROP", "보호사번호")
+CAREGIVER_LOOKUP_PROP = os.getenv("CAREGIVER_LOOKUP_PROP", "사번")
 
 # 제1원칙: Rate Limit 방어 상수
 _MAX_RETRIES     = 4        # 최대 재시도 횟수
@@ -580,6 +581,92 @@ async def create_ops_dashboard_row(
         f"meal={record.meal.done} med={record.medication.done} exc={record.excretion.done} "
         f"repo={record.repositioning.done} hyg={record.hygiene.done} "
         f"blocks={len(children)}"
+    )
+    return True, page_id, None
+
+
+# ══════════════════════════════════════════════════════════════════
+# SECTION 4-B: 인수인계 DB 전용 행 생성
+# 사령관 지정 DB: NOTION_HANDOVER_DB_ID (34cdbdd0...)
+# 속성 매핑: 보고서 제목 / 근무조 / 요약 / 긴급 특이사항 / 상태 / 수급자 / 요양보호사
+# ══════════════════════════════════════════════════════════════════
+
+async def create_handover_row(
+    care_record_id:    str,
+    full_refined:      str,
+    summary:           str,
+    urgent_note:       str,
+    recorded_at:       Optional[str],
+    client:            httpx.AsyncClient,
+    resident_page_id:  Optional[str] = None,
+    caregiver_page_id: Optional[str] = None,
+) -> tuple[bool, Optional[str], Optional[str]]:
+    """
+    인수인계 DB에 단 1행 생성.
+
+    DB 속성: 보고서 제목(title) / 근무조(select) / 요약(rich_text) /
+             긴급 특이사항(rich_text) / 상태(select) / 수급자(relation) / 요양보호사(relation)
+    """
+    if not NOTION_HANDOVER_DB_ID:
+        return False, None, "NOTION_HANDOVER_DB_ID 미설정"
+
+    ts_date = (recorded_at or "")[:10] or "now"
+    title_text = f"[{ts_date}] 인수인계 보고서"
+
+    properties: dict = {
+        "보고서 제목": {
+            "title": [{"type": "text", "text": {"content": title_text}}]
+        },
+        "근무조": {
+            "multi_select": [{"name": "야간조"}]
+        },
+        "요약": {
+            "rich_text": [{"type": "text", "text": {"content": summary[:2000]}}]
+        },
+        "긴급 특이사항": {
+            "rich_text": [{"type": "text", "text": {"content": urgent_note[:2000] if urgent_note else "없음"}}]
+        },
+        "상태": {
+            "status": {"name": "작성 완료"}
+        },
+    }
+
+    if resident_page_id:
+        properties["수급자"] = {"relation": [{"id": resident_page_id}]}
+    if caregiver_page_id:
+        properties["요양보호사"] = {"relation": [{"id": caregiver_page_id}]}
+
+    # 본문 블록: full_refined 전체 정제 텍스트
+    children = []
+    if full_refined:
+        children = [
+            {
+                "object": "block",
+                "type":   "paragraph",
+                "paragraph": {
+                    "rich_text": [{"type": "text", "text": {"content": full_refined[:2000]}}],
+                    "color": "default",
+                },
+            }
+        ]
+
+    body: dict = {
+        "parent":     {"database_id": NOTION_HANDOVER_DB_ID},
+        "properties": properties,
+    }
+    if children:
+        body["children"] = children
+
+    url = f"{NOTION_BASE_URL}/pages"
+    success, data, err = await _api_request_with_retry(client, "POST", url, json=body)
+    if not success:
+        logger.error(f"[HANDOVER-ROW] Notion 인수인계 DB 적재 실패: {err}")
+        return False, None, err
+
+    page_id = (data or {}).get("id", "")
+    logger.info(
+        f"[HANDOVER-ROW] ✅ 인수인계 DB 적재 완료 — "
+        f"care_record_id={care_record_id[:8]}… page_id={page_id[:8]}…"
     )
     return True, page_id, None
 
