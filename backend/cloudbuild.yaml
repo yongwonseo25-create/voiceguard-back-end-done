@@ -54,7 +54,6 @@ steps:
       - '-v'
     env:
       - 'DATABASE_URL=$$DATABASE_URL_TEST'
-      - 'GEMINI_API_KEY=$$GEMINI_API_KEY'
       - 'APP_CHECK_DEV_MODE=true'
     secretEnv:
       - 'DATABASE_URL_TEST'
