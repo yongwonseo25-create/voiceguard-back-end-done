@@ -48,10 +48,8 @@ steps:
         'pytest>=7.0' 'pytest-asyncio>=0.21' 'httpx>=0.28' -q &&
         pytest test_care_record_e2e.py test_ai_pipeline.py -x -v || true
     env:
-      - 'DATABASE_URL=$$DATABASE_URL_TEST'
       - 'APP_CHECK_DEV_MODE=true'
     secretEnv:
-      - 'DATABASE_URL_TEST'
       - 'GEMINI_API_KEY'
 
   # ── Step 4: Docker 이미지 빌드 (테스트 통과 후에만 실행) ─────────
@@ -130,8 +128,6 @@ images:
 # DATABASE_URL_TEST: 테스트 전용 DB — 운영 DB(DATABASE_URL)와 완전 분리 필수
 availableSecrets:
   secretManager:
-    - versionName: projects/upbeat-aura-484502-r2/secrets/DATABASE_URL_TEST/versions/latest
-      env: 'DATABASE_URL_TEST'
     - versionName: projects/upbeat-aura-484502-r2/secrets/GEMINI_API_KEY/versions/latest
       env: 'GEMINI_API_KEY'
 
