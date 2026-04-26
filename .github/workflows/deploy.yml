@@ -143,17 +143,27 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: "FRONT END/package-lock.json"
+          cache-dependency-path: "upgrade front_end/package-lock.json"
 
-      - name: 의존성 설치
-        working-directory: "FRONT END"
+      - name: 마이크 앱 의존성 설치
+        working-directory: "upgrade front_end"
         run: npm ci
 
-      - name: 프로덕션 빌드
-        working-directory: "FRONT END"
+      - name: 마이크 앱 빌드
+        working-directory: "upgrade front_end"
         run: |
           npm run build
-          echo "✅ 프론트엔드 빌드 완료"
+          echo "✅ 마이크 앱 빌드 완료"
+
+      - name: 대시보드 의존성 설치
+        working-directory: "upgrade front_end/dashboard"
+        run: npm install --legacy-peer-deps
+
+      - name: 대시보드 빌드
+        working-directory: "upgrade front_end/dashboard"
+        run: |
+          npm run build
+          echo "✅ 대시보드 빌드 완료 → upgrade front_end/dist/admin/"
 
       - name: Firebase CLI 설치 및 Hosting 배포
         run: |
