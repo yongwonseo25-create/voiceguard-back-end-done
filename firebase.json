@@ -1,7 +1,7 @@
 {
   "hosting": {
     "site": "voice-guard-app",
-    "public": "FRONT END/dist",
+    "public": "upgrade front_end/dist",
     "ignore": [
       "firebase.json",
       "**/.*",

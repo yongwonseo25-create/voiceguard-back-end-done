@@ -21,20 +21,30 @@ export const apiService = {
    * In a real app, this would send a Blob or base64 audio data.
    */
   async transcribeAudio(audioData?: Blob): Promise<TranscribeResponse> {
-    try {
-      // Simulate API call delay
-      await new Promise(resolve => setTimeout(resolve, 1500));
+    const formData = new FormData();
+    formData.append(
+      'audio_file',
+      audioData ?? new Blob([new ArrayBuffer(44)], { type: 'audio/wav' }),
+      'recording.wav'
+    );
+    const headers: Record<string, string> = {};
+    if (import.meta.env.VITE_MOCK_MODE === 'true') headers['X-Mock-Stt'] = 'true';
 
-      // For now, returning mock data as a placeholder for real integration
-      // Replace with: const response = await fetch(`${API_BASE_URL}/transcribe`, { method: 'POST', body: audioData });
-      return {
-        text: "현장 업무 기록입니다. 오늘 오전 10시 자재 입고 완료되었습니다.",
-        success: true
-      };
-    } catch (error) {
-      console.error('Transcription error:', error);
-      throw new Error('음성 인식에 실패했습니다.');
+    const response = await fetch(`${API_BASE_URL}/api/v8/test-ai-pipeline`, {
+      method: 'POST',
+      headers,
+      body: formData,
+    });
+    if (!response.ok) {
+      const msg = await response.text().catch(() => response.statusText);
+      throw new Error(`STT 변환 실패 (${response.status}): ${msg}`);
     }
+    const data = await response.json();
+    console.log('[VG-API] ✅ Whisper STT + Gemini 정제 완료:', data);
+    return {
+      text: data.gemini_analysis || data.whisper_transcript || '',
+      success: true,
+    };
   },
 
   /**

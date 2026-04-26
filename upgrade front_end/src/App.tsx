@@ -11,6 +11,21 @@ import { GlowingButton } from './components/ui/glowing-button';
 
 type Screen = 'HOME' | 'RECORDING' | 'REVIEW' | 'COMPLETING';
 
+// ── Mock Mode: VITE_MOCK_MODE=true 시 마이크 권한 팝업 없이 즉시 전환 ──
+const MOCK_MODE = import.meta.env.VITE_MOCK_MODE === 'true';
+
+function createSilentWav(): Blob {
+  const buf = new ArrayBuffer(44);
+  const v = new DataView(buf);
+  const w = (s: string, o: number) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  w('RIFF', 0); v.setUint32(4, 36, true); w('WAVE', 8);
+  w('fmt ', 12); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, 16000, true); v.setUint32(28, 32000, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w('data', 36); v.setUint32(40, 0, true);
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
 export default function App() {
   const [screen, setScreen] = useState<Screen>('HOME');
   const [homeView, setHomeView] = useState<'MAIN' | 'LOG_SUB' | 'HANDOVER_SUB' | 'KAKAO_SUB'>('MAIN');
@@ -112,6 +127,11 @@ export default function App() {
   }, [screen]);
 
   const startRecording = async (m: 'LOG' | 'KAKAO') => {
+    if (MOCK_MODE) {
+      console.log('[MOCK-MODE] 마이크 권한 우회 — 즉시 녹음 화면 전환');
+      setMode(m); setScreen('RECORDING'); setError(null);
+      return;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const recorder = new MediaRecorder(stream);
@@ -167,9 +187,12 @@ export default function App() {
   const stopRecording = async () => {
     setIsProcessing(true);
     try {
-      let audioBlob: Blob | undefined;
-      
-      if (mediaRecorder.current && mediaRecorder.current.state !== 'inactive') {
+      let audioBlob: Blob;
+
+      if (MOCK_MODE) {
+        console.log('[MOCK-MODE] 가짜 WAV Blob 생성 → 백엔드 전송');
+        audioBlob = createSilentWav();
+      } else if (mediaRecorder.current && mediaRecorder.current.state !== 'inactive') {
         const stoppedPromise = new Promise<void>((resolve) => {
           mediaRecorder.current!.onstop = () => resolve();
         });
@@ -178,10 +201,12 @@ export default function App() {
         audioBlob = new Blob(audioChunks.current, { type: 'audio/webm' });
       } else if (audioChunks.current && audioChunks.current.length > 0) {
         audioBlob = new Blob(audioChunks.current, { type: 'audio/webm' });
+      } else {
+        audioBlob = createSilentWav();
       }
 
       // Stop all mic tracks to relinquish hardware immediately
-      if (mediaRecorder.current?.stream) {
+      if (!MOCK_MODE && mediaRecorder.current?.stream) {
         mediaRecorder.current.stream.getTracks().forEach(track => track.stop());
       }
       
