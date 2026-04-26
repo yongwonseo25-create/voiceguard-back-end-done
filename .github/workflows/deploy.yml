@@ -91,6 +91,7 @@ jobs:
               'B2_APPLICATION_KEY=B2_APPLICATION_KEY:latest,' \
               'B2_BUCKET_NAME=B2_BUCKET_NAME:latest,' \
               'B2_ENDPOINT_URL=B2_ENDPOINT_URL:latest,' \
+              'OPENAI_API_KEY=OPENAI_API_KEY:latest,' \
               'GEMINI_API_KEY=GEMINI_API_KEY:latest,' \
               'GEMINI_MODEL=GEMINI_MODEL:latest,' \
               'NOTION_API_KEY=NOTION_API_KEY:latest,' \
